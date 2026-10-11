@@ -108,7 +108,7 @@ dialog-sheet { display: block; }
   <main id="view" class="flex-1 w-full max-w-6xl mx-auto px-4 pt-6 pb-28 md:pb-12" aria-live="polite"></main>
 
   <footer class="hidden md:block text-center text-xs text-[color:var(--muted)] pb-8 px-4">
-    Application de fans non officielle. Les données (votes, mur, tier list, fiches) sont enregistrées dans ton navigateur.
+    Application de fans non officielle. Avec un compte, votes, mur, tier lists et amis sont partagés entre tous les fans.
   </footer>
 </div>
 
@@ -201,21 +201,21 @@ const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 /* ---------- Mode partagé (db + user) ou mode local ---------- */
-const Cloud = { on: false, db: null, uid: null, docs: {}, ready: false, queue: Promise.resolve(), dirty: false };
+const Cloud = { on: false, mode: 'none', email: null, db: null, uid: null, docs: {}, ready: false, queue: Promise.resolve(), dirty: false };
 const localMe = () => S.users.find(u => u.id === S.session) || null;
 const cloudDoc = (id) => Cloud.docs[id || Cloud.uid] || null;
 const me = () => {
-  if (Cloud.on) { const d = cloudDoc(); return d && d.pseudo ? { id: Cloud.uid, pseudo: d.pseudo, favorite: d.favorite, email: null, createdAt: d.createdAt || Date.now(), cloud: true } : null; }
+  if (Cloud.on) { const d = cloudDoc(); return d && d.pseudo ? { id: Cloud.uid, pseudo: d.pseudo, favorite: d.favorite, email: Cloud.email || null, createdAt: d.createdAt || Date.now(), cloud: true } : null; }
   return localMe();
 };
 function cloudUpdate(patch) {
-  if (!Cloud.on) return Promise.resolve();
+  if (!Cloud.on || (Cloud.mode === 'firebase' && !Cloud.uid)) return Promise.resolve();
   const next = { ...(Cloud.docs[Cloud.uid] || {}), ...patch };
   Cloud.docs[Cloud.uid] = next;
   render();
   const run = async () => {
-    try { await Cloud.db.doc('u/' + Cloud.uid).set(next); }
-    catch (e) { toast(e && e.code === 'quota_exceeded' ? 'Stockage plein : impossible d\u2019enregistrer.' : 'Enregistrement impossible pour le moment.', 'err'); }
+    try { if (Cloud.mode === 'firebase') await FB.setDoc(Cloud.uid, next); else await Cloud.db.doc('u/' + Cloud.uid).set(next); }
+    catch (e) { console.warn(e); toast(e && e.code === 'quota_exceeded' ? 'Stockage plein : impossible d\u2019enregistrer.' : e && e.code === 'permission-denied' ? 'Action refusée par les règles de la base.' : 'Enregistrement impossible pour le moment.', 'err'); }
   };
   Cloud.queue = Cloud.queue.then(run, run);
   return Cloud.queue;
@@ -225,14 +225,42 @@ function softRender() {
   if (S.ui.modal || (ae && ['INPUT', 'TEXTAREA', 'SELECT'].includes(ae.tagName))) { Cloud.dirty = true; return; }
   render();
 }
+function fbError(e) {
+  const m = {
+    'auth/invalid-email': 'Adresse e-mail invalide.',
+    'auth/email-already-in-use': 'Cet e-mail est déjà inscrit. Connecte-toi.',
+    'auth/weak-password': 'Mot de passe trop faible (6 caractères minimum).',
+    'auth/invalid-credential': 'E-mail ou mot de passe incorrect.',
+    'auth/wrong-password': 'E-mail ou mot de passe incorrect.',
+    'auth/user-not-found': 'E-mail ou mot de passe incorrect.',
+    'auth/too-many-requests': 'Trop de tentatives. Réessaie dans quelques minutes.',
+    'auth/network-request-failed': 'Problème de connexion réseau.',
+    'auth/unauthorized-domain': 'Domaine non autorisé : ajoute-le dans Firebase > Authentication > Paramètres > Domaines autorisés.',
+    'auth/operation-not-allowed': 'Connexion e-mail/mot de passe non activée dans Firebase.'
+  };
+  return m[e && e.code] || 'Une erreur est survenue. Réessaie.';
+}
+async function initFirebase() {
+  Cloud.mode = 'firebase'; Cloud.on = true;
+  await new Promise((resolve) => {
+    let a = false, d = false;
+    const check = () => { if (a && d) resolve(); };
+    setTimeout(resolve, 8000);
+    FB.onAuth((u) => { Cloud.uid = u ? u.uid : null; Cloud.email = u ? u.email : null; a = true; check(); softRender(); });
+    FB.onDocs((docs) => { Cloud.docs = docs; Cloud.ready = true; d = true; check(); softRender(); },
+      (err) => { console.warn(err); Cloud.on = false; Cloud.mode = 'none'; Cloud.docs = {}; d = true; check(); toast('Base de données indisponible : retour au mode local.', 'err'); render(); });
+  });
+}
 async function initCloud() {
+  if (window.FB === undefined) await new Promise((res) => { window.addEventListener('fb-ready', res, { once: true }); setTimeout(res, 5000); });
+  if (window.FB) { try { await initFirebase(); } catch (e) { Cloud.on = false; Cloud.mode = 'none'; } return; }
   try {
     if (!window.claude || typeof window.claude.use !== 'function') return;
     const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
     if (!db || !user) return;
     const id = await user.id(); if (!id) return;
     if ((await user.can('data.write')) === false) return;
-    Cloud.db = db; Cloud.uid = id; Cloud.on = true;
+    Cloud.db = db; Cloud.uid = id; Cloud.on = true; Cloud.mode = 'claude';
     await new Promise((resolve) => {
       let first = true;
       const done = () => { if (first) { first = false; resolve(); } };
@@ -454,7 +482,7 @@ function renderChrome() {
   const u = me();
   $('#headerUser').innerHTML = u
     ? `<a href="#/profile" class="flex items-center gap-2 glass rounded-full pl-1 pr-3 py-1 hover:border-[color:var(--gold)] transition"><img src="${avatarSrc(acad(u.favorite) || { name: u.pseudo })}" alt="" class="w-7 h-7 rounded-full object-cover"><span class="text-sm font-medium max-w-[110px] truncate">${esc(u.pseudo)}</span></a>`
-    : `<button data-act="open-auth" class="btn-gold rounded-full px-4 py-2 text-sm">${Cloud.on ? 'Mon pseudo' : 'Se connecter'}</button>`;
+    : `<button data-act="open-auth" class="btn-gold rounded-full px-4 py-2 text-sm">${Cloud.on && Cloud.mode === 'claude' ? 'Mon pseudo' : 'Se connecter'}</button>`;
 }
 
 function render() {
@@ -839,10 +867,10 @@ function viewFriends() {
     <p class="text-[color:var(--muted)] mt-1">Ajoute des fans par leur pseudo pour voir leur académicien préféré et leur tier list.</p></div>`;
   if (!Cloud.on) return head + `<div class="glass rounded-3xl p-6 sm:p-8 max-w-xl">
     <h2 class="font-display font-bold text-xl">Les amis demandent un compte partagé</h2>
-    <p class="text-[color:var(--muted)] mt-2 text-sm">Sur cette version en ligne, les données restent dans ton navigateur : il n\u2019est pas possible de voir celles des autres fans. Les amis nécessitent un serveur partagé (non inclus ici).</p>
+    <p class="text-[color:var(--muted)] mt-2 text-sm">La base de données partagée est injoignable pour le moment. Recharge la page ou réessaie plus tard.</p>
     <a href="#/tier" class="btn-ghost inline-block rounded-xl px-5 py-2.5 text-sm mt-4">Faire ma tier list en attendant</a></div>`;
   const u = me();
-  if (!u) return head + `<div class="glass rounded-3xl p-8 text-center max-w-md"><p class="text-[color:var(--muted)]">Choisis d\u2019abord ton pseudo : c\u2019est lui que tes amis verront.</p><button data-act="open-auth" class="btn-gold rounded-xl px-6 py-3 mt-4">Choisir mon pseudo</button></div>`;
+  if (!u) return head + `<div class="glass rounded-3xl p-8 text-center max-w-md"><p class="text-[color:var(--muted)]">${Cloud.mode === 'firebase' && !Cloud.uid ? 'Connecte-toi pour ajouter des amis et voir leurs tier lists.' : 'Choisis d\u2019abord ton pseudo : c\u2019est lui que tes amis verront.'}</p><button data-act="open-auth" class="btn-gold rounded-xl px-6 py-3 mt-4">${Cloud.mode === 'firebase' && !Cloud.uid ? 'Se connecter' : 'Choisir mon pseudo'}</button></div>`;
   const friends = friendIds().filter(id => Cloud.docs[id]?.pseudo);
   const addedMe = Object.entries(Cloud.docs).filter(([id, x]) => id !== Cloud.uid && x.pseudo && Array.isArray(x.friends) && x.friends.includes(Cloud.uid) && !friends.includes(id));
   return head + `<div class="grid lg:grid-cols-5 gap-6">
@@ -881,7 +909,7 @@ function setupModal() {
     <div class="text-center mb-5">
       <div class="text-[color:var(--gold)] flex justify-center">${ICON.star.replace('w-4 h-4', 'w-8 h-8')}</div>
       <h2 class="font-display font-extrabold text-2xl gold-text mt-1">${d.pseudo ? 'Mon pseudo' : 'Bienvenue dans la promo'}</h2>
-      <p class="text-sm text-[color:var(--muted)] mt-1">Tu es connecté avec ton compte claude.ai : aucun mot de passe à retenir. Choisis le pseudo que les autres fans verront.</p>
+      <p class="text-sm text-[color:var(--muted)] mt-1">${Cloud.mode === 'claude' ? 'Tu es connecté avec ton compte claude.ai : aucun mot de passe à retenir. ' : ''}Choisis le pseudo que les autres fans verront.</p>
     </div>
     <div class="space-y-3.5">
       <div><label class="text-sm text-[color:var(--muted)]" for="s_pseudo">Pseudo</label><input id="s_pseudo" class="field mt-1" maxlength="16" autocomplete="nickname" placeholder="3 à 16 caractères" value="${esc(d.pseudo || '')}"></div>
@@ -938,13 +966,13 @@ function viewProfile() {
     <img src="${avatarSrc(fav || { name: u.pseudo })}" alt="" class="w-24 h-24 rounded-full object-cover border-2 border-[color:var(--gold)]" style="box-shadow:0 0 28px rgba(245,196,81,.4)">
     <div class="flex-1 min-w-0">
       <h1 class="font-display font-extrabold text-3xl gold-text truncate">${esc(u.pseudo)}</h1>
-      <p class="text-sm text-[color:var(--muted)] truncate">${esc(u.email || 'Connecté avec ton compte claude.ai')}</p>
+      <p class="text-sm text-[color:var(--muted)] truncate">${esc(u.email || (Cloud.mode === 'claude' ? 'Connecté avec ton compte claude.ai' : ''))}</p>
       <div class="mt-3 flex flex-wrap items-center gap-2">
         <label for="favSel" class="text-sm text-[color:var(--muted)]">Académicien favori</label>
         <select id="favSel" data-act="set-fav" class="field !w-auto !py-1.5 text-sm">${allAcads().map(a => `<option value="${a.id}" ${a.id === u.favorite ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
       </div>
     </div>
-    ${Cloud.on ? '<button data-act="open-auth" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Modifier mon pseudo</button>' : '<button data-act="logout" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Se déconnecter</button>'}
+    ${Cloud.mode === 'firebase' ? '<div class="flex flex-wrap gap-2 self-start sm:self-center"><button data-act="open-auth" class="btn-ghost rounded-xl px-4 py-2.5 text-sm">Modifier mon pseudo</button><button data-act="logout" class="btn-ghost rounded-xl px-4 py-2.5 text-sm">Se déconnecter</button></div>' : Cloud.on ? '<button data-act="open-auth" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Modifier mon pseudo</button>' : '<button data-act="logout" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Se déconnecter</button>'}
   </section>
   <section class="grid grid-cols-3 gap-3 mt-5">
     ${[['Votes publiés', mine.length], ['J\u2019aime reçus', likesGot], ['Inscrit le', new Date(u.createdAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })]].map(([l, v]) => `<div class="glass rounded-2xl p-4 text-center"><div class="font-display font-extrabold text-2xl gold-text">${v}</div><div class="text-xs text-[color:var(--muted)] mt-0.5">${l}</div></div>`).join('')}
@@ -975,7 +1003,7 @@ function closeModal() { S.ui.modal = null; renderModal(); if (Cloud.dirty) { Clo
 
 function renderModal() {
   const root = $('#modalRoot'), m = S.ui.modal;
-  if (m && m.type === 'auth' && Cloud.on) m.type = 'setup';
+  if (m && m.type === 'auth' && Cloud.on && (Cloud.mode !== 'firebase' || Cloud.uid)) m.type = 'setup';
   if (!m) { root.innerHTML = ''; document.body.style.overflow = ''; return; }
   document.body.style.overflow = 'hidden';
   let inner = '';
@@ -1014,7 +1042,7 @@ function authModal(mode) {
     <p id="authErr" class="text-sm text-rose-300 mt-3 min-h-[1.25rem]" role="alert"></p>
     <button class="btn-gold rounded-xl w-full py-3 mt-2" type="submit">${reg ? 'Créer mon compte' : 'Me connecter'}</button>
     <button type="button" data-act="guest" class="w-full text-center text-sm text-[color:var(--muted)] mt-4 hover:text-white">Continuer en invité</button>
-    <p class="text-[11px] text-center text-[color:var(--muted)] mt-3">Démo : les comptes sont enregistrés uniquement dans ce navigateur.</p>
+    ${Cloud.mode === 'firebase' ? (reg ? '' : '<button type="button" data-act="pw-reset" class="w-full text-center text-sm text-[color:var(--gold-soft)] mt-3 underline underline-offset-4">Mot de passe oublié ?</button>') + '<p class="text-[11px] text-center text-[color:var(--muted)] mt-3">Ton compte est partagé : ton pseudo, tes votes et ta tier list sont visibles des autres fans.</p>' : '<p class="text-[11px] text-center text-[color:var(--muted)] mt-3">Les comptes sont enregistrés uniquement dans ce navigateur.</p>'}
   </form>`;
 }
 
@@ -1199,7 +1227,12 @@ document.addEventListener('click', (e) => {
     case 'friend-add': addFriend(id); break;
     case 'friend-add-q': addFriendByPseudo(); break;
     case 'friend-del': removeFriend(id); break;
-    case 'logout': S.session = null; save(); toast('À bientôt !'); location.hash = '#/home'; render(); break;
+    case 'pw-reset': {
+      const em = ($('#f_email')?.value || '').trim();
+      if (!em) { toast('Saisis ton e-mail dans le formulaire.', 'err'); break; }
+      FB.resetPw(em).then(() => toast('E-mail de réinitialisation envoyé.')).catch(e => toast(fbError(e), 'err')); break;
+    }
+    case 'logout': if (Cloud.mode === 'firebase') { FB.signOut(); toast('À bientôt !'); location.hash = '#/home'; break; } S.session = null; save(); toast('À bientôt !'); location.hash = '#/home'; render(); break;
     case 'del-vote': {
       if (Cloud.on) { const d = cloudDoc() || {}; cloudUpdate({ history: (d.history || []).filter(h => String(h.ts) !== id), vote: d.vote && String(d.vote.ts) === id ? null : (d.vote || null) }); toast('Vote supprimé'); break; }
       S.votes = S.votes.filter(x => x.id !== id); save(); render(); toast('Vote supprimé'); break;
@@ -1251,6 +1284,27 @@ document.addEventListener('submit', async (e) => {
     const email = $('#f_email').value.trim().toLowerCase(), pw = $('#f_pw').value;
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err.textContent = 'Entre une adresse e-mail valide.';
     if (pw.length < 6) return err.textContent = 'Le mot de passe doit contenir au moins 6 caractères.';
+    if (Cloud.mode === 'firebase') {
+      const btn = f.querySelector('button[type=submit]'); if (btn) btn.disabled = true;
+      try {
+        if (reg) {
+          const pseudo = $('#f_pseudo').value.trim(), fav = $('#f_fav').value;
+          if (!/^[\p{L}\p{N}_. -]{3,16}$/u.test(pseudo)) { err.textContent = 'Pseudo de 3 à 16 caractères (lettres, chiffres, _ . -).'; return; }
+          if (Object.values(Cloud.docs).some(x => x.pseudo && x.pseudo.toLowerCase() === pseudo.toLowerCase())) { err.textContent = 'Ce pseudo est déjà pris.'; return; }
+          const cred = await FB.signUp(email, pw);
+          Cloud.uid = cred.user.uid; Cloud.email = email;
+          S.ui.pick = null; closeModal();
+          await cloudUpdate({ pseudo, favorite: fav, createdAt: Date.now() });
+          toast('Bienvenue, ' + pseudo + ' !');
+        } else {
+          await FB.signIn(email, pw);
+          closeModal(); toast('Re-bonjour !');
+          setTimeout(() => { if (Cloud.uid && !me()) openModal('setup'); }, 1500);
+        }
+      } catch (ex) { err.textContent = fbError(ex); }
+      finally { if (btn) btn.disabled = false; }
+      return;
+    }
     const h = await hashPw(email, pw);
     if (reg) {
       const pseudo = $('#f_pseudo').value.trim();
@@ -1300,7 +1354,7 @@ if (!location.hash) location.hash = '#/home';
 render();
 Promise.race([initCloud(), new Promise(r => setTimeout(r, 6000))]).finally(() => {
   render();
-  if (!me() && !S.guest) openModal(Cloud.on ? 'setup' : 'auth', { mode: 'register' });
+  if (!me() && !S.guest) openModal('auth', { mode: 'register' });
 });
 document.addEventListener('focusout', () => {
   if (!Cloud.dirty) return;
@@ -1309,6 +1363,43 @@ document.addEventListener('focusout', () => {
     if (!S.ui.modal && !(ae && ['INPUT', 'TEXTAREA', 'SELECT'].includes(ae.tagName))) { Cloud.dirty = false; render(); }
   }, 150);
 });
+</script>
+
+<script type="module">
+// Configuration Firebase du projet journal-star-ac (clé publique : la sécurité repose sur les règles Firestore)
+const cfg = {
+  apiKey: "AIzaSyAvURiphYWW4T_W01W4nU4-4Rl6-OTqTS4",
+  authDomain: "journal-star-ac.firebaseapp.com",
+  projectId: "journal-star-ac",
+  storageBucket: "journal-star-ac.firebasestorage.app",
+  messagingSenderId: "602523308836",
+  appId: "1:602523308836:web:1d50eac11fcf2e7521d9b1",
+  measurementId: "G-YPDWXLT9F2"
+};
+async function load() {
+  for (const v of ['13.0.0', '10.12.2']) {
+    try {
+      const base = 'https://www.gstatic.com/firebasejs/' + v + '/';
+      const [app, A, F] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
+      return { app, A, F };
+    } catch (e) { console.warn('SDK Firebase ' + v + ' indisponible', e); }
+  }
+  throw new Error('SDK Firebase introuvable');
+}
+try {
+  const { app: M, A, F } = await load();
+  const app = M.initializeApp(cfg), auth = A.getAuth(app), db = F.getFirestore(app);
+  window.FB = {
+    signUp: (e, p) => A.createUserWithEmailAndPassword(auth, e, p),
+    signIn: (e, p) => A.signInWithEmailAndPassword(auth, e, p),
+    signOut: () => A.signOut(auth),
+    resetPw: (e) => A.sendPasswordResetEmail(auth, e),
+    onAuth: (cb) => A.onAuthStateChanged(auth, cb),
+    onDocs: (cb, err) => F.onSnapshot(F.collection(db, 'u'), (snap) => { const o = {}; snap.forEach(d => { o[d.id] = d.data(); }); cb(o); }, err),
+    setDoc: (uid, data) => F.setDoc(F.doc(db, 'u', uid), data)
+  };
+} catch (e) { console.warn('Firebase indisponible : mode local', e); window.FB = null; }
+window.dispatchEvent(new Event('fb-ready'));
 </script>
 </body>
 </html>
