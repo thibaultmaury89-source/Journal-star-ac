@@ -1,40 +1,6 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-  <!-- Importer Firebase (version modulaire) -->
-<script type="module">
-  // Importez les fonctions dont vous avez besoin depuis le SDK Firebase
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-  import { getFirestore, collection, addDoc, getDocs } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
-
-  // Votre configuration Firebase récupérée à l'étape 3
-  const firebaseConfig = {
-    apiKey: "VOTRE_API_KEY",
-    authDomain: "VOTRE_AUTH_DOMAIN",
-    projectId: "VOTRE_PROJECT_ID",
-    storageBucket: "VOTRE_STORAGE_BUCKET",
-    messagingSenderId: "VOTRE_MESSAGING_SENDER_ID",
-    appId: "VOTRE_APP_ID"
-  };
-
-  // Initialiser Firebase
-  const app = initializeApp(firebaseConfig);
-  const db = getFirestore(app);
-
-  // Exemple : Enregistrer des données dans Firestore au lieu du localStorage
-  async function ajouterDonnee() {
-    try {
-      const docRef = await addDoc(collection(db, "tierlists"), {
-        nom: "Candidat 1",
-        insta: "lien_insta",
-        youtube: "lien_yt"
-      });
-      console.log("Document écrit avec l'ID: ", docRef.id);
-    } catch (e) {
-      console.error("Erreur lors de l'ajout : ", e);
-    }
-  }
-</script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
@@ -108,6 +74,9 @@ select.field option { background: #0d1238; color: #eef0ff; }
 dialog-sheet { display: block; }
 ::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-thumb { background: rgba(168, 85, 247, .45); border-radius: 8px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } .sparkle { display: none; } }
+.drop-hot { outline: 2px dashed var(--gold); outline-offset: -3px; background: rgba(245, 196, 81, .1) !important; }
+.tier-chip { cursor: grab; -webkit-user-drag: element; touch-action: manipulation; }
+.tier-chip:active { cursor: grabbing; }
 </style>
 </head>
 <body>
@@ -139,7 +108,7 @@ dialog-sheet { display: block; }
   <main id="view" class="flex-1 w-full max-w-6xl mx-auto px-4 pt-6 pb-28 md:pb-12" aria-live="polite"></main>
 
   <footer class="hidden md:block text-center text-xs text-[color:var(--muted)] pb-8 px-4">
-    Application de fans non officielle. Les données (votes, fil, fiches) sont stockées localement dans votre navigateur.
+    Application de fans non officielle. Les données (votes, mur, tier list, fiches) sont enregistrées dans ton navigateur.
   </footer>
 </div>
 
@@ -184,11 +153,14 @@ const S = {
   overrides: Store.get('sa_overrides', {}),
   tracks: Store.get('sa_tracks', []),
   guest: Store.get('sa_guest', false),
-  ui: { filter: 'Tous', pick: null, prime: 'Prime 1', modal: null, feedFilter: 'all' }
+  posts: Store.get('sa_posts', []),
+  tier: Store.get('sa_tier', null),
+  ui: { filter: 'Tous', pick: null, prime: 'Prime 1', modal: null, feedFilter: 'all', tierSel: null, friendQ: '' }
 };
 const save = () => {
   Store.set('sa_users', S.users); Store.set('sa_session', S.session); Store.set('sa_votes', S.votes);
   Store.set('sa_overrides', S.overrides); Store.set('sa_tracks', S.tracks); Store.set('sa_guest', S.guest);
+  Store.set('sa_posts', S.posts); Store.set('sa_tier', S.tier);
 };
 
 /* =========================================================
@@ -197,7 +169,63 @@ const save = () => {
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-const me = () => S.users.find(u => u.id === S.session) || null;
+/* ---------- Mode partagé (db + user) ou mode local ---------- */
+const Cloud = { on: false, db: null, uid: null, docs: {}, ready: false, queue: Promise.resolve(), dirty: false };
+const localMe = () => S.users.find(u => u.id === S.session) || null;
+const cloudDoc = (id) => Cloud.docs[id || Cloud.uid] || null;
+const me = () => {
+  if (Cloud.on) { const d = cloudDoc(); return d && d.pseudo ? { id: Cloud.uid, pseudo: d.pseudo, favorite: d.favorite, email: null, createdAt: d.createdAt || Date.now(), cloud: true } : null; }
+  return localMe();
+};
+function cloudUpdate(patch) {
+  if (!Cloud.on) return Promise.resolve();
+  const next = { ...(Cloud.docs[Cloud.uid] || {}), ...patch };
+  Cloud.docs[Cloud.uid] = next;
+  render();
+  const run = async () => {
+    try { await Cloud.db.doc('u/' + Cloud.uid).set(next); }
+    catch (e) { toast(e && e.code === 'quota_exceeded' ? 'Stockage plein : impossible d\u2019enregistrer.' : 'Enregistrement impossible pour le moment.', 'err'); }
+  };
+  Cloud.queue = Cloud.queue.then(run, run);
+  return Cloud.queue;
+}
+function softRender() {
+  const ae = document.activeElement;
+  if (S.ui.modal || (ae && ['INPUT', 'TEXTAREA', 'SELECT'].includes(ae.tagName))) { Cloud.dirty = true; return; }
+  render();
+}
+async function initCloud() {
+  try {
+    if (!window.claude || typeof window.claude.use !== 'function') return;
+    const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+    if (!db || !user) return;
+    const id = await user.id(); if (!id) return;
+    if ((await user.can('data.write')) === false) return;
+    Cloud.db = db; Cloud.uid = id; Cloud.on = true;
+    await new Promise((resolve) => {
+      let first = true;
+      const done = () => { if (first) { first = false; resolve(); } };
+      setTimeout(done, 8000);
+      db.collection('u').onSnapshot((snap) => {
+        const docs = {}; snap.docs.forEach(d => { docs[d.id] = d.data(); });
+        Cloud.docs = docs; Cloud.ready = true; done(); softRender();
+      }, () => { Cloud.on = false; Cloud.docs = {}; done(); toast('Mode partagé indisponible : retour au mode local.', 'err'); render(); });
+    });
+  } catch (e) { Cloud.on = false; }
+}
+const likersOf = (key) => Object.entries(Cloud.docs).filter(([, d]) => Array.isArray(d.liked) && d.liked.includes(key)).map(([id]) => id);
+function wallVotes() {
+  if (Cloud.on) return Object.entries(Cloud.docs).filter(([, d]) => d.vote && d.pseudo).map(([id, d]) => ({ id: id + ':v', userId: id, pseudo: d.pseudo, acadId: d.vote.acadId, text: String(d.vote.text || ''), ts: d.vote.ts || 0, week: d.vote.week, likes: likersOf(id + ':v') }));
+  return S.votes;
+}
+function wallTiers() {
+  if (Cloud.on) return Object.entries(Cloud.docs).filter(([, d]) => d.tierPost && d.pseudo).map(([id, d]) => ({ id: id + ':t', userId: id, pseudo: d.pseudo, tiers: d.tierPost.tiers || {}, ts: d.tierPost.ts || 0, likes: likersOf(id + ':t') }));
+  return S.posts;
+}
+const myVotes = (u) => {
+  if (Cloud.on) { const d = cloudDoc() || {}; return (d.history || []).map(h => ({ ...h, id: String(h.ts), likes: d.vote && h.ts === d.vote.ts ? likersOf(Cloud.uid + ':v') : [] })).sort((a, b) => b.ts - a.ts); }
+  return S.votes.filter(v => v.userId === u.id).sort((a, b) => b.ts - a.ts);
+};
 const acad = (id) => {
   const base = ACADEMICIENS.find(a => a.id === id); if (!base) return null;
   const ov = Object.fromEntries(Object.entries(S.overrides[id] || {}).filter(([, v]) => v !== null && v !== '' && v !== undefined));
@@ -257,6 +285,8 @@ const ICON = {
   grad: '<path d="M12 3L1 9l11 6 9-4.9V17h2V9zM5 13.2V17c0 1.7 3.1 3 7 3s7-1.3 7-3v-3.8l-7 3.8z"/>',
   pen: '<path d="M3 17.3V21h3.7L18.8 8.9l-3.7-3.7zM21.7 6.3a1 1 0 000-1.4l-2.6-2.6a1 1 0 00-1.4 0l-1.8 1.8 3.7 3.7z"/>',
   music: '<path d="M9 18V5l12-2v13M9 18a3 3 0 11-6 0 3 3 0 016 0zm12-2a3 3 0 11-6 0 3 3 0 016 0z" fill="none" stroke="currentColor" stroke-width="2"/>',
+  tier: '<path d="M3 4h18v4H3zM3 10h14v4H3zM3 16h9v4H3z"/>',
+  friends: '<path d="M9 11a4 4 0 100-8 4 4 0 000 8zm0 2c-3.900 0-7 1.800-7 4v2h14v-2c0-2.200-3.100-4-7-4zm8-2.500a3 3 0 100-6 3 3 0 000 6zm1 1.800c2.500.4 4 1.700 4 3.200v1.500h-4v-2c0-1-.5-1.900-1.500-2.700.5-.1.900 0 1.500 0z"/>',
   user: '<path d="M12 12a5 5 0 100-10 5 5 0 000 10zm0 2c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5z"/>',
   spotify: '<svg viewBox="0 0 24 24" class="w-5 h-5" fill="currentColor" aria-hidden="true"><path d="M12 1a11 11 0 100 22 11 11 0 000-22zm5 15.9a.8.8 0 01-1.1.3c-3-1.8-6.700-2.200-11.100-1.200a.8.8 0 11-.4-1.500c4.800-1.100 9-.6 12.300 1.400.4.200.5.700.3 1zm1.400-3.100a1 1 0 01-1.400.3c-3.400-2.100-8.600-2.700-12.600-1.500a1 1 0 01-.6-1.900c4.600-1.400 10.300-.7 14.200 1.700.4.300.6.900.4 1.400zm.1-3.300C14.400 8.500 7.600 8.300 3.700 9.500a1.200 1.200 0 11-.7-2.300c4.500-1.400 12-1.100 16.600 1.700a1.200 1.200 0 01-1.100 2.100z"/></svg>',
   deezer: '<svg viewBox="0 0 24 24" class="w-5 h-5" fill="currentColor" aria-hidden="true"><rect x="1" y="17" width="4.2" height="2.6"/><rect x="6.2" y="17" width="4.2" height="2.6"/><rect x="11.4" y="17" width="4.2" height="2.6"/><rect x="16.6" y="17" width="4.2" height="2.6"/><rect x="6.2" y="13" width="4.2" height="2.6"/><rect x="11.4" y="13" width="4.2" height="2.6"/><rect x="16.6" y="13" width="4.2" height="2.6"/><rect x="11.4" y="9" width="4.2" height="2.6"/><rect x="16.6" y="9" width="4.2" height="2.6"/><rect x="16.6" y="5" width="4.2" height="2.6"/></svg>',
@@ -334,7 +364,7 @@ window.addEventListener('storage', (e) => { if (e.key === 'sa_votes') { S.votes 
    ========================================================= */
 function weekCounts() {
   const wk = mondayKey(), map = {};
-  S.votes.filter(v => v.week === wk).forEach(v => { map[v.acadId] = (map[v.acadId] || 0) + 1; });
+  wallVotes().filter(v => v.week === wk).forEach(v => { map[v.acadId] = (map[v.acadId] || 0) + 1; });
   const total = Object.values(map).reduce((a, b) => a + b, 0);
   const ranked = Object.entries(map).map(([id, n]) => ({ a: acad(id), n })).filter(x => x.a).sort((x, y) => y.n - x.n);
   return { ranked, total, map };
@@ -374,9 +404,11 @@ setInterval(tickCountdown, 1000);
    ========================================================= */
 const ROUTES = [
   { id: 'home', label: 'Accueil', icon: ICON.home },
-  { id: 'academy', label: 'Académiciens', icon: ICON.grad },
-  { id: 'votes', label: 'Journal & Votes', icon: ICON.pen },
-  { id: 'music', label: 'Playlists', icon: ICON.music },
+  { id: 'academy', label: 'Académiciens', short: 'Élèves', icon: ICON.grad },
+  { id: 'votes', label: 'Journal & Votes', short: 'Journal', icon: ICON.pen },
+  { id: 'tier', label: 'Tier list', short: 'Tier list', icon: ICON.tier },
+  { id: 'music', label: 'Playlists', short: 'Playlist', icon: ICON.music },
+  { id: 'friends', label: 'Amis', short: 'Amis', icon: ICON.friends },
   { id: 'profile', label: 'Profil', icon: ICON.user }
 ];
 const route = () => { const r = (location.hash.replace('#/', '') || 'home'); return ROUTES.some(x => x.id === r) ? r : 'home'; };
@@ -385,12 +417,12 @@ function renderChrome() {
   const r = route();
   $('#topnav').innerHTML = ROUTES.filter(x => x.id !== 'profile').map(x =>
     `<a href="#/${x.id}" class="tab-btn px-3.5 py-2 rounded-lg text-sm font-medium ${r === x.id ? 'bg-white/10 text-[color:var(--gold)]' : 'text-[color:var(--muted)] hover:text-white'}" ${r === x.id ? 'aria-current="page"' : ''}>${x.label}</a>`).join('');
-  $('#bottomnav').innerHTML = `<div class="grid grid-cols-5 max-w-lg mx-auto">` + ROUTES.map(x =>
-    `<a href="#/${x.id}" class="flex flex-col items-center gap-0.5 py-2 text-[10.5px] ${r === x.id ? 'nav-active' : 'text-[color:var(--muted)]'}" ${r === x.id ? 'aria-current="page"' : ''}>${svgIcon(x.icon)}<span>${x.id === 'votes' ? 'Journal' : x.label}</span></a>`).join('') + `</div>`;
+  $('#bottomnav').innerHTML = `<div class="grid grid-cols-6 max-w-lg mx-auto">` + ROUTES.filter(x => x.id !== 'profile').map(x =>
+    `<a href="#/${x.id}" class="flex flex-col items-center gap-0.5 py-2 text-[10.5px] ${r === x.id ? 'nav-active' : 'text-[color:var(--muted)]'}" ${r === x.id ? 'aria-current="page"' : ''}>${svgIcon(x.icon)}<span>${x.short || x.label}</span></a>`).join('') + `</div>`;
   const u = me();
   $('#headerUser').innerHTML = u
     ? `<a href="#/profile" class="flex items-center gap-2 glass rounded-full pl-1 pr-3 py-1 hover:border-[color:var(--gold)] transition"><img src="${avatarSrc(acad(u.favorite) || { name: u.pseudo })}" alt="" class="w-7 h-7 rounded-full object-cover"><span class="text-sm font-medium max-w-[110px] truncate">${esc(u.pseudo)}</span></a>`
-    : `<button data-act="open-auth" class="btn-gold rounded-full px-4 py-2 text-sm">Se connecter</button>`;
+    : `<button data-act="open-auth" class="btn-gold rounded-full px-4 py-2 text-sm">${Cloud.on ? 'Mon pseudo' : 'Se connecter'}</button>`;
 }
 
 function render() {
@@ -398,7 +430,9 @@ function render() {
   const r = route();
   const v = $('#view');
   const scroll = window.scrollY;
-  v.innerHTML = ({ home: viewHome, academy: viewAcademy, votes: viewVotes, music: viewMusic, profile: viewProfile })[r]();
+  const prevC = $('#comment'), keepComment = prevC ? prevC.value : null;
+  v.innerHTML = ({ home: viewHome, academy: viewAcademy, votes: viewVotes, tier: viewTier, music: viewMusic, friends: viewFriends, profile: viewProfile })[r]();
+  const newC = $('#comment'); if (keepComment !== null && newC) newC.value = keepComment;
   window.scrollTo(0, scroll);
   tickCountdown();
   renderModal();
@@ -523,13 +557,18 @@ function viewAcademy() {
    ========================================================= */
 function viewVotes() {
   const u = me(), wk = mondayKey();
-  const mine = u ? S.votes.find(v => v.userId === u.id && v.week === wk) : null;
+  const mine = u ? wallVotes().find(v => v.userId === u.id && v.week === wk) : null;
   if (S.ui.pick === null) S.ui.pick = mine ? mine.acadId : (u && acad(u.favorite)?.status !== 'Éliminé' ? u.favorite : null);
-  const feed = S.votes.filter(v => S.ui.feedFilter === 'all' || v.acadId === S.ui.feedFilter).slice(0, 60);
+  const ff = S.ui.feedFilter;
+  const feed = [
+    ...wallVotes().filter(v => ff === 'all' || v.acadId === ff).map(v => ({ k: 'v', ts: v.ts, v })),
+    ...(ff === 'all' ? wallTiers().map(t => ({ k: 't', ts: t.ts, v: t })) : [])
+  ].sort((a, b) => b.ts - a.ts).slice(0, 60);
   return `
   <div class="mb-6">
     <h1 class="font-display font-extrabold text-3xl sm:text-4xl">Journal &amp; <span class="gold-text">votes</span></h1>
     <p class="text-[color:var(--muted)] mt-1">Vote pour ton académicien de la semaine et laisse un mot de ${MAX_COMMENT} caractères maximum.</p>
+    <p class="text-xs mt-2 ${Cloud.on ? 'text-emerald-300' : 'text-[color:var(--muted)]'}">${Cloud.on ? 'Mur partagé : tu vois les publications des autres fans en direct.' : 'Mur local : les publications restent dans ce navigateur.'}</p>
   </div>
   <div class="grid lg:grid-cols-5 gap-6">
     <section class="lg:col-span-2 lg:sticky lg:top-24 self-start">
@@ -564,14 +603,14 @@ function viewVotes() {
 
     <section class="lg:col-span-3">
       <div class="flex items-center justify-between gap-3 mb-3">
-        <h2 class="font-display font-bold text-xl flex items-center gap-2">Le fil des fans <span class="inline-flex items-center gap-1.5 text-xs font-sans font-medium text-emerald-300"><span class="relative flex w-2 h-2"><span class="animate-ping absolute inline-flex w-full h-full rounded-full bg-emerald-400 opacity-70"></span><span class="relative w-2 h-2 rounded-full bg-emerald-400"></span></span>en direct</span></h2>
+        <h2 class="font-display font-bold text-xl flex items-center gap-2">Le mur des fans <span class="inline-flex items-center gap-1.5 text-xs font-sans font-medium text-emerald-300"><span class="relative flex w-2 h-2"><span class="animate-ping absolute inline-flex w-full h-full rounded-full bg-emerald-400 opacity-70"></span><span class="relative w-2 h-2 rounded-full bg-emerald-400"></span></span>en direct</span></h2>
         <select data-act="feed-filter" class="field !w-auto !py-1.5 text-sm" aria-label="Filtrer le fil par académicien">
           <option value="all">Tous les élèves</option>
           ${allAcads().map(a => `<option value="${a.id}" ${S.ui.feedFilter === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
         </select>
       </div>
       <div class="space-y-3" id="feed">
-        ${feed.length ? feed.map(feedItem).join('') : `<div class="glass rounded-2xl p-8 text-center text-[color:var(--muted)]">Aucun bulletin pour cet élève. Sois le premier à publier !</div>`}
+        ${feed.length ? feed.map(x => x.k === 'v' ? feedItem(x.v) : tierFeedItem(x.v)).join('') : `<div class="glass rounded-2xl p-8 text-center text-[color:var(--muted)]">Aucun bulletin pour cet élève. Sois le premier à publier !</div>`}
       </div>
     </section>
   </div>`;
@@ -608,7 +647,12 @@ function submitVote() {
   if (!S.ui.pick) return toast('Choisis un académicien avant de publier.', 'err');
   if (!text) return toast('Ajoute un mini-commentaire (1 à ' + MAX_COMMENT + ' caractères).', 'err');
   if (text.length > MAX_COMMENT) return toast('Maximum ' + MAX_COMMENT + ' caractères.', 'err');
-  const wk = mondayKey(), ex = S.votes.find(v => v.userId === u.id && v.week === wk);
+  const wk = mondayKey(), ex = wallVotes().find(v => v.userId === u.id && v.week === wk);
+  if (Cloud.on) {
+    const d = cloudDoc() || {}, entry = { acadId: S.ui.pick, text, ts: Date.now(), week: wk };
+    cloudUpdate({ vote: entry, history: [entry, ...(d.history || []).filter(h => h.week !== wk)].slice(0, 30) });
+    toast(ex ? 'Vote modifié' : 'Vote publié'); return;
+  }
   if (ex) { ex.acadId = S.ui.pick; ex.text = text; ex.ts = Date.now(); toast('Vote modifié'); }
   else { S.votes.unshift({ id: uid(), userId: u.id, pseudo: u.pseudo, acadId: S.ui.pick, text, ts: Date.now(), week: wk, likes: [], fresh: true }); toast('Vote publié'); }
   S.votes.sort((a, b) => b.ts - a.ts);
@@ -618,6 +662,206 @@ function submitVote() {
 /* =========================================================
    VUE : PLAYLISTS
    ========================================================= */
+/* =========================================================
+   TIER LIST
+   ========================================================= */
+const TIERS = [
+  { id: 'M', label: 'Masterclass', grad: 'linear-gradient(135deg,#ffe9a8,#f5c451 55%,#d9a520)', fg: '#2a1c00' },
+  { id: 'S', label: 'Super', grad: 'linear-gradient(135deg,#c084fc,#7c3aed)', fg: '#fff' },
+  { id: 'X', label: 'Mid', grad: 'linear-gradient(135deg,#60a5fa,#2563eb)', fg: '#fff' },
+  { id: 'L', label: 'J\u2019aime moins', grad: 'linear-gradient(135deg,#fb7185,#be123c)', fg: '#fff' }
+];
+function tierState() {
+  if (!S.tier || typeof S.tier !== 'object') S.tier = { M: [], S: [], X: [], L: [] };
+  const valid = new Set(ACADEMICIENS.map(a => a.id)), seen = new Set();
+  TIERS.forEach(t => { S.tier[t.id] = (Array.isArray(S.tier[t.id]) ? S.tier[t.id] : []).filter(i => valid.has(i) && !seen.has(i) && seen.add(i)); });
+  return S.tier;
+}
+function tierPool() {
+  const t = tierState(), placed = new Set(TIERS.flatMap(x => t[x.id]));
+  return ACADEMICIENS.map(a => a.id).filter(i => !placed.has(i));
+}
+function placeInTier(aid, zone) {
+  const t = tierState();
+  TIERS.forEach(x => { t[x.id] = t[x.id].filter(i => i !== aid); });
+  if (zone !== 'pool' && t[zone]) t[zone].push(aid);
+  S.ui.tierSel = null; save(); render();
+}
+function tierChip(aid) {
+  const a = acad(aid); if (!a) return '';
+  const sel = S.ui.tierSel === aid;
+  return `<button type="button" draggable="true" data-drag="${aid}" data-act="tier-pick" data-id="${aid}" aria-pressed="${sel}" class="tier-chip relative w-14 sm:w-16 text-center rounded-xl p-0.5 transition ${sel ? 'ring-2 ring-[color:var(--gold)] bg-[rgba(245,196,81,.22)] scale-105' : 'hover:bg-white/10'}">
+    <img src="${avatarSrc(a)}" alt="${esc(a.name)}" draggable="false" class="w-full aspect-square rounded-full object-cover object-top border border-white/20 pointer-events-none">
+    <span class="block text-[10px] leading-tight mt-0.5 truncate pointer-events-none">${esc(a.name)}</span></button>`;
+}
+function viewTier() {
+  const t = tierState(), pool = tierPool(), u = me(), sel = S.ui.tierSel;
+  const mineT = Cloud.on ? cloudDoc()?.tierPost : (u ? S.posts.find(p => p.userId === u.id) : null);
+  const ranked = ACADEMICIENS.length - pool.length;
+  const hot = sel ? ' cursor-pointer ring-1 ring-[color:var(--gold)]/40' : '';
+  return `
+  <div class="mb-6">
+    <h1 class="font-display font-extrabold text-3xl sm:text-4xl">Ma <span class="gold-text">tier list</span></h1>
+    <p class="text-[color:var(--muted)] mt-1">Classe les ${ACADEMICIENS.length} académiciens : glisse-dépose, ou touche un élève puis le rang où le placer. Publie ensuite ta tier list sur le mur.</p>
+  </div>
+  <div class="space-y-2.5">
+    ${TIERS.map(T => `
+      <div data-zone="${T.id}" data-act="tier-drop" class="glass rounded-2xl overflow-hidden flex items-stretch min-h-[84px]${hot}">
+        <div class="w-24 sm:w-36 shrink-0 grid place-items-center text-center font-display font-extrabold text-sm sm:text-lg px-2" style="background:${T.grad};color:${T.fg}">${T.label}</div>
+        <div class="flex-1 flex flex-wrap items-center gap-1.5 p-2" data-zone="${T.id}" data-act="tier-drop">
+          ${t[T.id].map(tierChip).join('') || `<span class="text-xs text-[color:var(--muted)] px-2">${sel ? 'Touche ici pour placer l\u2019élève' : 'Dépose des élèves ici'}</span>`}
+        </div>
+      </div>`).join('')}
+  </div>
+  <section data-zone="pool" data-act="tier-drop" class="glass rounded-2xl p-3 mt-4${hot}">
+    <div class="flex items-center justify-between mb-2"><h2 class="font-semibold text-sm">Non classés <span class="text-[color:var(--muted)]">(${pool.length})</span></h2>${sel ? '<span class="text-xs text-[color:var(--gold-soft)]">Touche un rang pour y placer l\u2019élève sélectionné</span>' : ''}</div>
+    <div class="flex flex-wrap gap-1.5">${pool.map(tierChip).join('') || '<span class="text-sm text-[color:var(--muted)] px-2">Tout le monde est classé. Tu peux publier !</span>'}</div>
+  </section>
+  <div class="flex flex-wrap items-center gap-3 mt-5">
+    <button data-act="tier-publish" class="btn-gold rounded-xl px-6 py-3 flex items-center gap-2 ${ranked ? '' : 'opacity-50'}">${ICON.star} Publier sur le mur</button>
+    <button data-act="tier-reset" class="btn-ghost rounded-xl px-5 py-3 text-sm">Réinitialiser</button>
+    <span class="text-xs text-[color:var(--muted)]">${mineT ? 'Dernière publication : ' + timeAgo(mineT.ts) + ' · <a href="#/votes" class="text-[color:var(--gold-soft)] underline underline-offset-4">voir le mur</a>' : (u ? 'Pas encore publiée.' : 'Connecte-toi pour publier.')}</span>
+  </div>`;
+}
+function publishTier() {
+  const u = me(); if (!u) return openModal('auth');
+  const t = tierState();
+  if (!TIERS.some(x => t[x.id].length)) return toast('Classe au moins un académicien avant de publier.', 'err');
+  const snap = Object.fromEntries(TIERS.map(x => [x.id, [...t[x.id]]]));
+  if (Cloud.on) cloudUpdate({ tierPost: { tiers: snap, ts: Date.now() } });
+  else { S.posts = S.posts.filter(p => p.userId !== u.id); S.posts.unshift({ id: uid(), userId: u.id, pseudo: u.pseudo, tiers: snap, ts: Date.now(), likes: [] }); save(); }
+  toast('Tier list publiée sur le mur');
+  location.hash = '#/votes';
+}
+function tierMini(tiers) {
+  tiers = tiers || {};
+  return `<div class="space-y-1">` + TIERS.map(T => {
+    const ids = Array.isArray(tiers[T.id]) ? tiers[T.id] : [];
+    return `<div class="flex items-stretch rounded-lg overflow-hidden bg-black/25"><div class="w-[72px] sm:w-24 shrink-0 grid place-items-center text-[10px] sm:text-[11px] font-bold text-center px-1 py-1" style="background:${T.grad};color:${T.fg}">${T.label}</div>
+      <div class="flex flex-wrap gap-1 p-1.5 min-h-[40px] flex-1 items-center">${ids.map(id => { const a = acad(id); return a ? `<button data-act="open-fiche" data-id="${a.id}" title="${esc(a.name)}" class="shrink-0"><img src="${avatarSrc(a)}" alt="${esc(a.name)}" class="w-8 h-8 rounded-full object-cover object-top border border-white/25"></button>` : ''; }).join('') || '<span class="text-[10px] text-[color:var(--muted)]">—</span>'}</div></div>`;
+  }).join('') + `</div>`;
+}
+function tierFeedItem(t) {
+  const u = me(), liked = u && t.likes.includes(u.id), isMine = u && t.userId === u.id;
+  return `<article class="glass rounded-2xl p-4 flex gap-3 ${isMine ? 'ring-1 ring-[color:var(--gold)]/50' : ''}">
+    ${fanInitial(t.pseudo)}
+    <div class="min-w-0 flex-1">
+      <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span class="font-semibold text-sm">${esc(t.pseudo)}${isMine ? ' <span class="text-[color:var(--gold)] text-xs">(toi)</span>' : ''}</span>
+        <span class="text-xs text-[color:var(--muted)]">${timeAgo(t.ts)}</span>
+        <span class="ml-auto inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium border border-violet-400/40 bg-violet-400/10 text-violet-200">${ICON.star} a publié sa tier list</span>
+      </div>
+      <div class="mt-2.5">${tierMini(t.tiers)}</div>
+      <button data-act="like" data-id="${esc(t.id)}" class="mt-2 inline-flex items-center gap-1.5 text-xs transition ${liked ? 'text-rose-400' : 'text-[color:var(--muted)] hover:text-rose-300'}" aria-pressed="${!!liked}" aria-label="J'aime">${ICON.heart} ${t.likes.length}</button>
+    </div>
+  </article>`;
+}
+// Glisser-déposer (ordinateur)
+document.addEventListener('dragstart', (e) => {
+  const c = e.target.closest && e.target.closest('[data-drag]'); if (!c) return;
+  e.dataTransfer.setData('text/plain', c.dataset.drag); e.dataTransfer.effectAllowed = 'move';
+});
+document.addEventListener('dragover', (e) => { const z = e.target.closest && e.target.closest('[data-zone]'); if (z) { e.preventDefault(); z.classList.add('drop-hot'); } });
+document.addEventListener('dragleave', (e) => { const z = e.target.closest && e.target.closest('[data-zone]'); if (z && !z.contains(e.relatedTarget)) z.classList.remove('drop-hot'); });
+document.addEventListener('drop', (e) => {
+  const z = e.target.closest && e.target.closest('[data-zone]'); if (!z) return;
+  e.preventDefault();
+  const id = e.dataTransfer.getData('text/plain');
+  if (ACADEMICIENS.some(a => a.id === id)) placeInTier(id, z.dataset.zone);
+});
+
+/* =========================================================
+   AMIS (mode partagé)
+   ========================================================= */
+function friendIds() { return (cloudDoc()?.friends || []).filter(id => id !== Cloud.uid); }
+function addFriend(id) {
+  if (!Cloud.on || !me() || !Cloud.docs[id]?.pseudo || id === Cloud.uid) return;
+  const f = new Set(friendIds()); f.add(id);
+  cloudUpdate({ friends: [...f].slice(0, 200) }); toast('Ami ajouté');
+}
+function removeFriend(id) { cloudUpdate({ friends: friendIds().filter(x => x !== id) }); toast('Ami retiré'); }
+function addFriendByPseudo() {
+  if (!me()) return openModal('auth');
+  const q = ($('#friendQ')?.value || '').trim().toLowerCase();
+  if (!q) return toast('Saisis le pseudo de ton ami.', 'err');
+  const hit = Object.entries(Cloud.docs).find(([id, x]) => id !== Cloud.uid && x.pseudo && x.pseudo.toLowerCase() === q);
+  if (!hit) return toast('Aucun fan avec ce pseudo.', 'err');
+  if (friendIds().includes(hit[0])) return toast('Déjà dans tes amis.', 'err');
+  addFriend(hit[0]); S.ui.friendQ = '';
+}
+function friendRow(id, x, actions) {
+  const fav = acad(x.favorite);
+  return `<div class="flex items-center gap-3 rounded-xl p-2 hover:bg-white/5">
+    <img src="${avatarSrc(fav || { name: x.pseudo })}" alt="" class="w-10 h-10 rounded-full object-cover object-top border border-white/20 shrink-0">
+    <div class="min-w-0 flex-1"><div class="text-sm font-semibold truncate">${esc(x.pseudo)}</div><div class="text-xs text-[color:var(--muted)] truncate">${fav ? 'Favori : ' + esc(fav.name) : 'Pas de favori'}</div></div>
+    ${actions}</div>`;
+}
+function friendSuggestHTML() {
+  const mineIds = new Set(friendIds()), q = (S.ui.friendQ || '').trim().toLowerCase();
+  const list = Object.entries(Cloud.docs).filter(([id, x]) => id !== Cloud.uid && x.pseudo && !mineIds.has(id) && (!q || x.pseudo.toLowerCase().includes(q))).slice(0, 12);
+  if (!list.length) return `<p class="text-sm text-[color:var(--muted)] p-2">${q ? 'Aucun fan trouvé.' : 'Aucun autre fan inscrit pour l\u2019instant. Invite tes amis à ouvrir l\u2019application et à choisir un pseudo.'}</p>`;
+  return list.map(([id, x]) => friendRow(id, x, `<button data-act="friend-add" data-id="${esc(id)}" class="btn-gold rounded-lg px-3 py-1.5 text-xs shrink-0">Ajouter</button>`)).join('');
+}
+function viewFriends() {
+  const head = `<div class="mb-6"><h1 class="font-display font-extrabold text-3xl sm:text-4xl">Mes <span class="gold-text">amis</span></h1>
+    <p class="text-[color:var(--muted)] mt-1">Ajoute des fans par leur pseudo pour voir leur académicien préféré et leur tier list.</p></div>`;
+  if (!Cloud.on) return head + `<div class="glass rounded-3xl p-6 sm:p-8 max-w-xl">
+    <h2 class="font-display font-bold text-xl">Les amis demandent un compte partagé</h2>
+    <p class="text-[color:var(--muted)] mt-2 text-sm">Sur cette version en ligne, les données restent dans ton navigateur : il n\u2019est pas possible de voir celles des autres fans. Les amis nécessitent un serveur partagé (non inclus ici).</p>
+    <a href="#/tier" class="btn-ghost inline-block rounded-xl px-5 py-2.5 text-sm mt-4">Faire ma tier list en attendant</a></div>`;
+  const u = me();
+  if (!u) return head + `<div class="glass rounded-3xl p-8 text-center max-w-md"><p class="text-[color:var(--muted)]">Choisis d\u2019abord ton pseudo : c\u2019est lui que tes amis verront.</p><button data-act="open-auth" class="btn-gold rounded-xl px-6 py-3 mt-4">Choisir mon pseudo</button></div>`;
+  const friends = friendIds().filter(id => Cloud.docs[id]?.pseudo);
+  const addedMe = Object.entries(Cloud.docs).filter(([id, x]) => id !== Cloud.uid && x.pseudo && Array.isArray(x.friends) && x.friends.includes(Cloud.uid) && !friends.includes(id));
+  return head + `<div class="grid lg:grid-cols-5 gap-6">
+    <section class="lg:col-span-2 space-y-4 self-start">
+      <div class="glass rounded-3xl p-5">
+        <div class="text-xs text-[color:var(--muted)]">Mon pseudo</div>
+        <div class="flex items-center justify-between gap-2"><div class="font-display font-bold text-xl gold-text truncate">${esc(u.pseudo)}</div><button data-act="open-auth" class="text-xs text-[color:var(--gold-soft)] underline underline-offset-4">Modifier</button></div>
+        <label for="friendQ" class="block text-sm text-[color:var(--muted)] mt-4 mb-1.5">Ajouter un ami</label>
+        <div class="flex gap-2"><input id="friendQ" class="field" maxlength="16" autocomplete="off" placeholder="Pseudo de ton ami" value="${esc(S.ui.friendQ)}"><button data-act="friend-add-q" class="btn-gold rounded-xl px-4 text-sm shrink-0">Ajouter</button></div>
+        <div id="friendSuggest" class="mt-3 max-h-72 overflow-y-auto">${friendSuggestHTML()}</div>
+      </div>
+      ${addedMe.length ? `<div class="glass rounded-3xl p-5"><h2 class="font-semibold text-sm mb-2">Ils t\u2019ont ajouté</h2>${addedMe.map(([id, x]) => friendRow(id, x, `<button data-act="friend-add" data-id="${esc(id)}" class="btn-ghost rounded-lg px-3 py-1.5 text-xs shrink-0">Ajouter aussi</button>`)).join('')}</div>` : ''}
+    </section>
+    <section class="lg:col-span-3 space-y-4">
+      <h2 class="font-display font-bold text-xl">Mes amis <span class="text-[color:var(--muted)] text-base">(${friends.length})</span></h2>
+      ${friends.length ? friends.map(id => {
+    const x = Cloud.docs[id], fav = acad(x.favorite), tp = x.tierPost;
+    return `<article class="glass rounded-2xl p-4">
+        <div class="flex items-center gap-3">
+          <img src="${avatarSrc(fav || { name: x.pseudo })}" alt="" class="w-14 h-14 rounded-full object-cover object-top border-2 border-[color:var(--gold)]/60 shrink-0">
+          <div class="min-w-0 flex-1">
+            <div class="font-semibold truncate">${esc(x.pseudo)}</div>
+            <div class="text-sm text-[color:var(--muted)]">${fav ? `Académicien préféré : <button data-act="open-fiche" data-id="${fav.id}" class="text-[color:var(--gold-soft)] underline underline-offset-4">${esc(fav.name)}</button>` : 'Pas d\u2019académicien préféré'}</div>
+          </div>
+          <button data-act="friend-del" data-id="${esc(id)}" class="text-[color:var(--muted)] hover:text-rose-300 text-xs shrink-0">Retirer</button>
+        </div>
+        <div class="mt-3">${tp ? `<div class="text-xs text-[color:var(--muted)] mb-1.5">Tier list publiée ${timeAgo(tp.ts)}</div>${tierMini(tp.tiers)}` : '<p class="text-sm text-[color:var(--muted)]">Pas encore de tier list publiée.</p>'}</div>
+      </article>`;
+  }).join('') : `<div class="glass rounded-2xl p-8 text-center text-[color:var(--muted)]">Tu n\u2019as pas encore d\u2019amis ici. Ajoute un fan par son pseudo pour voir ses choix.</div>`}
+    </section>
+  </div>`;
+}
+function setupModal() {
+  const d = cloudDoc() || {};
+  return `<form id="setupForm" class="p-6 sm:p-8" novalidate>
+    <div class="text-center mb-5">
+      <div class="text-[color:var(--gold)] flex justify-center">${ICON.star.replace('w-4 h-4', 'w-8 h-8')}</div>
+      <h2 class="font-display font-extrabold text-2xl gold-text mt-1">${d.pseudo ? 'Mon pseudo' : 'Bienvenue dans la promo'}</h2>
+      <p class="text-sm text-[color:var(--muted)] mt-1">Tu es connecté avec ton compte claude.ai : aucun mot de passe à retenir. Choisis le pseudo que les autres fans verront.</p>
+    </div>
+    <div class="space-y-3.5">
+      <div><label class="text-sm text-[color:var(--muted)]" for="s_pseudo">Pseudo</label><input id="s_pseudo" class="field mt-1" maxlength="16" autocomplete="nickname" placeholder="3 à 16 caractères" value="${esc(d.pseudo || '')}"></div>
+      <div><label class="text-sm text-[color:var(--muted)]" for="s_fav">Ton académicien favori</label>
+        <select id="s_fav" class="field mt-1">${allAcads().map(a => `<option value="${a.id}" ${a.id === d.favorite ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
+    </div>
+    <p id="setupErr" class="text-sm text-rose-300 mt-3 min-h-[1.25rem]" role="alert"></p>
+    <button class="btn-gold rounded-xl w-full py-3 mt-2" type="submit">${d.pseudo ? 'Enregistrer' : 'Commencer'}</button>
+    ${d.pseudo ? '' : '<button type="button" data-act="guest" class="w-full text-center text-sm text-[color:var(--muted)] mt-4 hover:text-white">Continuer en invité</button>'}
+  </form>`;
+}
+
 function allTracks() {
   return [...S.tracks];
 }
@@ -655,20 +899,20 @@ function viewProfile() {
     <h1 class="font-display font-bold text-2xl">Ton espace fan</h1>
     <p class="text-[color:var(--muted)] mt-2">Connecte-toi pour retrouver ton historique de votes et tes mini-commentaires.</p>
     <button data-act="open-auth" class="btn-gold rounded-xl px-6 py-3 mt-5">Se connecter ou s'inscrire</button></div>`;
-  const fav = acad(u.favorite), mine = S.votes.filter(v => v.userId === u.id).sort((a, b) => b.ts - a.ts);
+  const fav = acad(u.favorite), mine = myVotes(u);
   const likesGot = mine.reduce((n, v) => n + v.likes.length, 0);
   return `
   <section class="glass rounded-3xl p-6 sm:p-8 flex flex-col sm:flex-row sm:items-center gap-5">
     <img src="${avatarSrc(fav || { name: u.pseudo })}" alt="" class="w-24 h-24 rounded-full object-cover border-2 border-[color:var(--gold)]" style="box-shadow:0 0 28px rgba(245,196,81,.4)">
     <div class="flex-1 min-w-0">
       <h1 class="font-display font-extrabold text-3xl gold-text truncate">${esc(u.pseudo)}</h1>
-      <p class="text-sm text-[color:var(--muted)] truncate">${esc(u.email)}</p>
+      <p class="text-sm text-[color:var(--muted)] truncate">${esc(u.email || 'Connecté avec ton compte claude.ai')}</p>
       <div class="mt-3 flex flex-wrap items-center gap-2">
         <label for="favSel" class="text-sm text-[color:var(--muted)]">Académicien favori</label>
         <select id="favSel" data-act="set-fav" class="field !w-auto !py-1.5 text-sm">${allAcads().map(a => `<option value="${a.id}" ${a.id === u.favorite ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
       </div>
     </div>
-    <button data-act="logout" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Se déconnecter</button>
+    ${Cloud.on ? '<button data-act="open-auth" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Modifier mon pseudo</button>' : '<button data-act="logout" class="btn-ghost rounded-xl px-4 py-2.5 text-sm self-start sm:self-center">Se déconnecter</button>'}
   </section>
   <section class="grid grid-cols-3 gap-3 mt-5">
     ${[['Votes publiés', mine.length], ['J\u2019aime reçus', likesGot], ['Inscrit le', new Date(u.createdAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })]].map(([l, v]) => `<div class="glass rounded-2xl p-4 text-center"><div class="font-display font-extrabold text-2xl gold-text">${v}</div><div class="text-xs text-[color:var(--muted)] mt-0.5">${l}</div></div>`).join('')}
@@ -695,14 +939,16 @@ function viewProfile() {
    ========================================================= */
 let pendingPhoto = null;
 function openModal(type, data = {}) { S.ui.modal = { type, ...data }; pendingPhoto = null; render(); }
-function closeModal() { S.ui.modal = null; renderModal(); }
+function closeModal() { S.ui.modal = null; renderModal(); if (Cloud.dirty) { Cloud.dirty = false; render(); } }
 
 function renderModal() {
   const root = $('#modalRoot'), m = S.ui.modal;
+  if (m && m.type === 'auth' && Cloud.on) m.type = 'setup';
   if (!m) { root.innerHTML = ''; document.body.style.overflow = ''; return; }
   document.body.style.overflow = 'hidden';
   let inner = '';
   if (m.type === 'auth') inner = authModal(m.mode || 'login');
+  if (m.type === 'setup') inner = setupModal();
   if (m.type === 'fiche') inner = ficheModal(m.id);
   if (m.type === 'edit') inner = editModal(m.id);
   if (m.type === 'track') inner = trackModal();
@@ -871,12 +1117,23 @@ document.addEventListener('click', (e) => {
     case 'vote-for': S.ui.pick = id; S.ui.modal = null; location.hash = '#/votes'; render(); if (!me()) openModal('auth'); break;
     case 'like': {
       const u = me(); if (!u) return openModal('auth');
-      const vt = S.votes.find(x => x.id === id); if (!vt) return;
+      if (Cloud.on) { const l = new Set(cloudDoc()?.liked || []); l.has(id) ? l.delete(id) : l.add(id); cloudUpdate({ liked: [...l].slice(-300) }); break; }
+      const vt = S.votes.find(x => x.id === id) || S.posts.find(x => x.id === id); if (!vt) return;
       const i = vt.likes.indexOf(u.id); i >= 0 ? vt.likes.splice(i, 1) : vt.likes.push(u.id);
       save(); render(); break;
     }
+    case 'tier-pick': S.ui.tierSel = S.ui.tierSel === id ? null : id; render(); break;
+    case 'tier-drop': if (S.ui.tierSel) placeInTier(S.ui.tierSel, el.dataset.zone); break;
+    case 'tier-reset': S.tier = { M: [], S: [], X: [], L: [] }; S.ui.tierSel = null; save(); render(); break;
+    case 'tier-publish': publishTier(); break;
+    case 'friend-add': addFriend(id); break;
+    case 'friend-add-q': addFriendByPseudo(); break;
+    case 'friend-del': removeFriend(id); break;
     case 'logout': S.session = null; save(); toast('À bientôt !'); location.hash = '#/home'; render(); break;
-    case 'del-vote': S.votes = S.votes.filter(x => x.id !== id); save(); render(); toast('Vote supprimé'); break;
+    case 'del-vote': {
+      if (Cloud.on) { const d = cloudDoc() || {}; cloudUpdate({ history: (d.history || []).filter(h => String(h.ts) !== id), vote: d.vote && String(d.vote.ts) === id ? null : (d.vote || null) }); toast('Vote supprimé'); break; }
+      S.votes = S.votes.filter(x => x.id !== id); save(); render(); toast('Vote supprimé'); break;
+    }
     case 'del-track': S.tracks = S.tracks.filter(x => x.id !== id); save(); render(); break;
     case 'rm-photo': { const f = $('#editForm'); const aid = f.dataset.id; S.overrides[aid] = { ...(S.overrides[aid] || {}) }; delete S.overrides[aid].photo; save(); S.ui.modal = { type: 'edit', id: aid }; renderModal(); render(); break; }
   }
@@ -884,7 +1141,7 @@ document.addEventListener('click', (e) => {
 document.addEventListener('change', (e) => {
   const el = e.target;
   if (el.dataset?.act === 'feed-filter') { S.ui.feedFilter = el.value; render(); }
-  if (el.dataset?.act === 'set-fav') { const u = me(); u.favorite = el.value; save(); render(); toast('Favori mis à jour'); }
+  if (el.dataset?.act === 'set-fav') { const u = me(); if (Cloud.on) cloudUpdate({ favorite: el.value }); else { u.favorite = el.value; save(); render(); } toast('Favori mis à jour'); }
   if (el.id === 'photoIn' && el.files[0]) {
     const img = new Image(), url = URL.createObjectURL(el.files[0]);
     img.onload = () => {
@@ -898,15 +1155,27 @@ document.addEventListener('change', (e) => {
 });
 document.addEventListener('input', (e) => {
   if (e.target.id === 'comment') updateCounter();
+  if (e.target.id === 'friendQ') { S.ui.friendQ = e.target.value; const box = $('#friendSuggest'); if (box) box.innerHTML = friendSuggestHTML(); }
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && S.ui.modal) closeModal();
   if (e.key === 'Enter' && e.target.id === 'comment') { e.preventDefault(); submitVote(); }
+  if (e.key === 'Enter' && e.target.id === 'friendQ') { e.preventDefault(); addFriendByPseudo(); }
 });
 
 document.addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
+  if (f.id === 'setupForm') {
+    const err = $('#setupErr'), pseudo = $('#s_pseudo').value.trim(), fav = $('#s_fav').value;
+    if (!/^[\p{L}\p{N}_. -]{3,16}$/u.test(pseudo)) return err.textContent = 'Pseudo de 3 à 16 caractères (lettres, chiffres, _ . -).';
+    const taken = Object.entries(Cloud.docs).some(([id, x]) => id !== Cloud.uid && x.pseudo && x.pseudo.toLowerCase() === pseudo.toLowerCase());
+    if (taken) return err.textContent = 'Ce pseudo est déjà pris.';
+    const d = cloudDoc() || {};
+    S.ui.pick = null; closeModal();
+    await cloudUpdate({ pseudo, favorite: fav, createdAt: d.createdAt || Date.now() });
+    toast('Bienvenue, ' + pseudo + ' !'); return;
+  }
   if (f.id === 'authForm') {
     const reg = f.dataset.mode === 'register', err = $('#authErr');
     const email = $('#f_email').value.trim().toLowerCase(), pw = $('#f_pw').value;
@@ -959,7 +1228,17 @@ document.addEventListener('submit', async (e) => {
 })();
 if (!location.hash) location.hash = '#/home';
 render();
-if (!me() && !S.guest) openModal('auth', { mode: 'register' });
+Promise.race([initCloud(), new Promise(r => setTimeout(r, 6000))]).finally(() => {
+  render();
+  if (!me() && !S.guest) openModal(Cloud.on ? 'setup' : 'auth', { mode: 'register' });
+});
+document.addEventListener('focusout', () => {
+  if (!Cloud.dirty) return;
+  setTimeout(() => {
+    const ae = document.activeElement;
+    if (!S.ui.modal && !(ae && ['INPUT', 'TEXTAREA', 'SELECT'].includes(ae.tagName))) { Cloud.dirty = false; render(); }
+  }, 150);
+});
 </script>
 </body>
 </html>
