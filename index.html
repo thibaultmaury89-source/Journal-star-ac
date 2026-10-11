@@ -1,6 +1,40 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
+  <!-- Importer Firebase (version modulaire) -->
+<script type="module">
+  // Importez les fonctions dont vous avez besoin depuis le SDK Firebase
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+  import { getFirestore, collection, addDoc, getDocs } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+  // Votre configuration Firebase récupérée à l'étape 3
+  const firebaseConfig = {
+    apiKey: "VOTRE_API_KEY",
+    authDomain: "VOTRE_AUTH_DOMAIN",
+    projectId: "VOTRE_PROJECT_ID",
+    storageBucket: "VOTRE_STORAGE_BUCKET",
+    messagingSenderId: "VOTRE_MESSAGING_SENDER_ID",
+    appId: "VOTRE_APP_ID"
+  };
+
+  // Initialiser Firebase
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // Exemple : Enregistrer des données dans Firestore au lieu du localStorage
+  async function ajouterDonnee() {
+    try {
+      const docRef = await addDoc(collection(db, "tierlists"), {
+        nom: "Candidat 1",
+        insta: "lien_insta",
+        youtube: "lien_yt"
+      });
+      console.log("Document écrit avec l'ID: ", docRef.id);
+    } catch (e) {
+      console.error("Erreur lors de l'ajout : ", e);
+    }
+  }
+</script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
