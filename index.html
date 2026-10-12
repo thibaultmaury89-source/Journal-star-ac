@@ -201,7 +201,7 @@ const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 /* ---------- Mode partagé (db + user) ou mode local ---------- */
-const Cloud = { on: false, mode: 'none', email: null, db: null, uid: null, docs: {}, ready: false, queue: Promise.resolve(), dirty: false };
+const Cloud = { on: false, mode: 'none', fiches: {}, isAdmin: false, email: null, db: null, uid: null, docs: {}, ready: false, queue: Promise.resolve(), dirty: false };
 const localMe = () => S.users.find(u => u.id === S.session) || null;
 const cloudDoc = (id) => Cloud.docs[id || Cloud.uid] || null;
 const me = () => {
@@ -222,6 +222,7 @@ function cloudUpdate(patch) {
 }
 function softRender() {
   const ae = document.activeElement;
+  if (route() === 'blind' && document.querySelector('#view iframe')) { Cloud.dirty = true; return; }
   if (S.ui.modal || (ae && ['INPUT', 'TEXTAREA', 'SELECT'].includes(ae.tagName))) { Cloud.dirty = true; return; }
   render();
 }
@@ -242,23 +243,29 @@ function fbError(e) {
     'auth/popup-blocked': 'Fenêtre bloquée par le navigateur : autorise les pop-ups pour ce site.',
     'auth/account-exists-with-different-credential': 'Un compte existe déjà avec cet e-mail via une autre méthode (Google, Facebook ou e-mail). Utilise la méthode d\u2019origine.'
   };
-  return m[e && e.code] || 'Une erreur est survenue. Réessaie.';
+  return m[e && e.code] || ('Une erreur est survenue' + (e && e.code ? ' (code : ' + e.code + ')' : '') + '. Réessaie.');
 }
 function ensureProfile() {
   if (Cloud.mode === 'firebase' && Cloud.uid && Cloud.ready && !cloudDoc()?.pseudo && !S.ui.modal && !Cloud.asked) { Cloud.asked = true; openModal('setup'); }
 }
 async function socialLogin(kind) {
-  const showErr = (m) => { const el = $('#authErr'); if (el) el.textContent = m; else toast(m, 'err'); };
+  const showErr = (m, html) => { const el = $('#authErr'); if (el) { if (html) el.innerHTML = m; else el.textContent = m; } else toast(String(m).replace(/<[^>]+>/g, ''), 'err'); };
   const prev = $('#authErr'); if (prev) prev.textContent = '';
+  const t0 = Date.now();
   try {
     await (kind === 'google' ? FB.signInGoogle() : FB.signInFacebook());
     closeModal(); toast('Connecté !');
     setTimeout(() => { if (Cloud.uid && !me()) openModal('setup'); }, 800);
   } catch (e) {
+    console.warn('Connexion ' + kind + ' :', e);
     if (e && (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment')) {
       try { await FB.signInRedirect(kind); return; } catch (e2) { showErr(fbError(e2)); return; }
     }
-    if (e && (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request')) return;
+    if (e && (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request')) {
+      if (Date.now() - t0 > 6000) return; // fermée volontairement
+      showErr('La fenêtre s\u2019est fermée avant la fin de la connexion (' + e.code + '). Causes fréquentes : cookies ou stockage tiers bloqués (Safari, Brave, navigation privée, navigateur intégré à une application), ou méthode non activée dans Firebase. <button type="button" data-act="social-redirect" data-v="' + kind + '" class="underline underline-offset-4 text-[color:var(--gold-soft)]">Essayer sans fenêtre (redirection)</button>', true);
+      return;
+    }
     showErr(fbError(e));
   }
 }
@@ -275,11 +282,12 @@ function socialButtons() {
 }
 async function initFirebase() {
   Cloud.mode = 'firebase'; Cloud.on = true;
+  FB.onFiches((o) => { Cloud.fiches = o; softRender(); }, (e) => { console.warn('Fiches partagées indisponibles', e); Cloud.fiches = {}; });
   await new Promise((resolve) => {
     let a = false, d = false;
     const check = () => { if (a && d) resolve(); };
     setTimeout(resolve, 8000);
-    FB.onAuth((u) => { Cloud.uid = u ? u.uid : null; Cloud.email = u ? u.email : null; if (!u) Cloud.asked = false; a = true; check(); softRender(); ensureProfile(); });
+    FB.onAuth((u) => { Cloud.uid = u ? u.uid : null; Cloud.email = u ? u.email : null; if (!u) Cloud.asked = false; if (u) FB.isAdmin(u.uid).then(v => { Cloud.isAdmin = v; softRender(); }); else Cloud.isAdmin = false; a = true; check(); softRender(); ensureProfile(); });
     FB.onDocs((docs) => { Cloud.docs = docs; Cloud.ready = true; d = true; check(); softRender(); ensureProfile(); },
       (err) => { console.warn(err); Cloud.on = false; Cloud.mode = 'none'; Cloud.docs = {}; d = true; check(); toast('Base de données indisponible : retour au mode local.', 'err'); render(); });
   });
@@ -320,7 +328,16 @@ const myVotes = (u) => {
 };
 const acad = (id) => {
   const base = ACADEMICIENS.find(a => a.id === id); if (!base) return null;
-  const ov = Object.fromEntries(Object.entries(S.overrides[id] || {}).filter(([, v]) => v !== null && v !== '' && v !== undefined));
+  const src = Cloud.mode === 'firebase' ? (Cloud.fiches[id] || {}) : (S.overrides[id] || {});
+  const ov = Object.fromEntries(Object.entries(src).filter(([, v]) => v !== null && v !== '' && v !== undefined));
+  if (Cloud.mode === 'firebase') {
+    if ('insta' in ov) ov.insta = parseInsta(ov.insta);
+    if ('tiktok' in ov) ov.tiktok = parseTiktok(ov.tiktok);
+    if ('shortUrl' in ov) ov.shortUrl = cleanShort(ov.shortUrl);
+    if ('status' in ov && !STATUSES.includes(ov.status)) delete ov.status;
+    ['age', 'nominations', 'tops'].forEach(k => { if (k in ov) { const n = parseInt(ov[k], 10); if (isNaN(n)) delete ov[k]; else ov[k] = n; } });
+    if ('city' in ov) ov.city = String(ov.city).slice(0, 60);
+  }
   return { ...base, ...ov };
 };
 const cleanHandle = (v) => {
@@ -378,6 +395,7 @@ const ICON = {
   grad: '<path d="M12 3L1 9l11 6 9-4.9V17h2V9zM5 13.2V17c0 1.7 3.1 3 7 3s7-1.3 7-3v-3.8l-7 3.8z"/>',
   pen: '<path d="M3 17.3V21h3.7L18.8 8.9l-3.7-3.7zM21.7 6.3a1 1 0 000-1.4l-2.6-2.6a1 1 0 00-1.4 0l-1.8 1.8 3.7 3.7z"/>',
   music: '<path d="M9 18V5l12-2v13M9 18a3 3 0 11-6 0 3 3 0 016 0zm12-2a3 3 0 11-6 0 3 3 0 016 0z" fill="none" stroke="currentColor" stroke-width="2"/>',
+  quiz: '<path d="M11 18h2v-2h-2v2zm1-16C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.500 2 12 2zm0 18c-4.400 0-8-3.600-8-8s3.600-8 8-8 8 3.600 8 8-3.600 8-8 8zm0-14c-2.200 0-4 1.800-4 4h2c0-1.100.900-2 2-2s2 .900 2 2c0 2-3 1.800-3 5h2c0-2.300 3-2.500 3-5 0-2.200-1.800-4-4-4z"/>',
   tier: '<path d="M3 4h18v4H3zM3 10h14v4H3zM3 16h9v4H3z"/>',
   friends: '<path d="M9 11a4 4 0 100-8 4 4 0 000 8zm0 2c-3.900 0-7 1.800-7 4v2h14v-2c0-2.200-3.100-4-7-4zm8-2.500a3 3 0 100-6 3 3 0 000 6zm1 1.800c2.500.4 4 1.700 4 3.200v1.500h-4v-2c0-1-.5-1.900-1.500-2.700.5-.1.900 0 1.500 0z"/>',
   user: '<path d="M12 12a5 5 0 100-10 5 5 0 000 10zm0 2c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5z"/>',
@@ -501,6 +519,7 @@ const ROUTES = [
   { id: 'votes', label: 'Journal & Votes', short: 'Journal', icon: ICON.pen },
   { id: 'tier', label: 'Tier list', short: 'Tier list', icon: ICON.tier },
   { id: 'music', label: 'Playlists', short: 'Playlist', icon: ICON.music },
+  { id: 'blind', label: 'Blind test', short: 'Blind test', icon: ICON.quiz },
   { id: 'friends', label: 'Amis', short: 'Amis', icon: ICON.friends },
   { id: 'profile', label: 'Profil', icon: ICON.user }
 ];
@@ -510,8 +529,8 @@ function renderChrome() {
   const r = route();
   $('#topnav').innerHTML = ROUTES.filter(x => x.id !== 'profile').map(x =>
     `<a href="#/${x.id}" class="tab-btn px-3.5 py-2 rounded-lg text-sm font-medium ${r === x.id ? 'bg-white/10 text-[color:var(--gold)]' : 'text-[color:var(--muted)] hover:text-white'}" ${r === x.id ? 'aria-current="page"' : ''}>${x.label}</a>`).join('');
-  $('#bottomnav').innerHTML = `<div class="grid grid-cols-6 max-w-lg mx-auto">` + ROUTES.filter(x => x.id !== 'profile').map(x =>
-    `<a href="#/${x.id}" class="flex flex-col items-center gap-0.5 py-2 text-[10.5px] ${r === x.id ? 'nav-active' : 'text-[color:var(--muted)]'}" ${r === x.id ? 'aria-current="page"' : ''}>${svgIcon(x.icon)}<span>${x.short || x.label}</span></a>`).join('') + `</div>`;
+  $('#bottomnav').innerHTML = `<div class="grid grid-cols-7 max-w-xl mx-auto">` + ROUTES.filter(x => x.id !== 'profile').map(x =>
+    `<a href="#/${x.id}" class="flex flex-col items-center gap-0.5 py-2 text-[9.5px] leading-tight text-center ${r === x.id ? 'nav-active' : 'text-[color:var(--muted)]'}" ${r === x.id ? 'aria-current="page"' : ''}>${svgIcon(x.icon)}<span>${x.short || x.label}</span></a>`).join('') + `</div>`;
   const u = me();
   $('#headerUser').innerHTML = u
     ? `<a href="#/profile" class="flex items-center gap-2 glass rounded-full pl-1 pr-3 py-1 hover:border-[color:var(--gold)] transition"><img src="${avatarSrc(acad(u.favorite) || { name: u.pseudo })}" alt="" class="w-7 h-7 rounded-full object-cover"><span class="text-sm font-medium max-w-[110px] truncate">${esc(u.pseudo)}</span></a>`
@@ -521,10 +540,11 @@ function renderChrome() {
 function render() {
   renderChrome();
   const r = route();
+  if (r !== 'blind') stopBlindTimer();
   const v = $('#view');
   const scroll = window.scrollY;
   const prevC = $('#comment'), keepComment = prevC ? prevC.value : null;
-  v.innerHTML = ({ home: viewHome, academy: viewAcademy, votes: viewVotes, tier: viewTier, music: viewMusic, friends: viewFriends, profile: viewProfile })[r]();
+  v.innerHTML = ({ home: viewHome, academy: viewAcademy, votes: viewVotes, tier: viewTier, music: viewMusic, blind: viewBlind, friends: viewFriends, profile: viewProfile })[r]();
   const newC = $('#comment'); if (keepComment !== null && newC) newC.value = keepComment;
   window.scrollTo(0, scroll);
   tickCountdown();
@@ -955,6 +975,176 @@ function setupModal() {
   </form>`;
 }
 
+/* =========================================================
+   BLIND TEST (QCM) : qui a chanté ce titre au prime ?
+   ========================================================= */
+const BLIND_SECONDS = 20;
+let blindTimer = null;
+function stopBlindTimer() { if (blindTimer) { clearInterval(blindTimer); blindTimer = null; } }
+function shuffle(arr) { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function blindPool() {
+  const map = new Map();
+  allAcads().forEach(a => {
+    if (!a.perf) return;
+    const k = a.perf.t.toLowerCase();
+    if (!map.has(k)) map.set(k, { title: a.perf.t, artist: a.perf.a, note: a.perf.note || '', singers: [] });
+    map.get(k).singers.push(a.id);
+  });
+  return [...map.values()].map(q => q.singers.length > 1 ? { ...q, note: '' } : q);
+}
+function buildBlindQuestions(n) {
+  return shuffle(blindPool()).slice(0, n).map(q => {
+    const correctId = q.singers[Math.floor(Math.random() * q.singers.length)];
+    const others = shuffle(allAcads().filter(a => !q.singers.includes(a.id))).slice(0, 3).map(a => a.id);
+    return { ...q, correctId, options: shuffle([correctId, ...others]) };
+  });
+}
+function blindStart(n) {
+  const qs = buildBlindQuestions(n);
+  if (!qs.length) return;
+  S.ui.blind = { phase: 'play', qs, i: 0, score: 0, correct: 0, picked: null, ok: false, gain: 0, timeLeft: BLIND_SECONDS, results: [] };
+  render(); startBlindTimer();
+}
+function startBlindTimer() {
+  stopBlindTimer();
+  blindTimer = setInterval(() => {
+    const b = S.ui.blind;
+    if (!b || b.phase !== 'play' || b.picked) return stopBlindTimer();
+    b.timeLeft--;
+    const bar = $('#blindBar'), sec = $('#blindSec');
+    if (bar) bar.style.width = Math.max(0, b.timeLeft / BLIND_SECONDS * 100) + '%';
+    if (sec) sec.textContent = Math.max(0, b.timeLeft);
+    if (b.timeLeft <= 0) blindAnswer('timeout');
+  }, 1000);
+}
+function blindAnswer(pick) {
+  const b = S.ui.blind; if (!b || b.phase !== 'play' || b.picked) return;
+  stopBlindTimer();
+  const q = b.qs[b.i], ok = pick !== 'timeout' && q.singers.includes(pick);
+  b.picked = pick; b.ok = ok;
+  if (ok) { b.correct++; b.gain = 100 + Math.max(0, b.timeLeft) * 5; b.score += b.gain; } else b.gain = 0;
+  b.results.push({ title: q.title, ok, singers: q.singers });
+  render();
+}
+function blindNext() {
+  const b = S.ui.blind; if (!b || !b.picked) return;
+  if (b.i + 1 >= b.qs.length) {
+    b.phase = 'end';
+    const best = Store.get('sa_blind_best', 0);
+    b.record = b.score > best;
+    if (b.record) Store.set('sa_blind_best', b.score);
+    render();
+  } else { b.i++; b.picked = null; b.ok = false; b.gain = 0; b.timeLeft = BLIND_SECONDS; render(); startBlindTimer(); }
+}
+function ytId(url) {
+  try {
+    const u = new URL(url), h = u.hostname.replace(/^(www|m)\./, '');
+    let id = null;
+    if (h === 'youtu.be') id = u.pathname.split('/')[1];
+    else if (h === 'youtube.com') {
+      if (u.pathname.startsWith('/shorts/') || u.pathname.startsWith('/embed/')) id = u.pathname.split('/')[2];
+      else if (u.pathname === '/watch') id = u.searchParams.get('v');
+    }
+    return id && /^[A-Za-z0-9_-]{6,20}$/.test(id) ? id : null;
+  } catch (e) { return null; }
+}
+function blindExtracts(q) {
+  return q.singers.map(id => acad(id)).filter(a => a && a.shortUrl).map(a => ({ a, id: ytId(a.shortUrl) })).filter(x => x.id);
+}
+function extractPlayers(ex) {
+  return `<div class="mt-4"><div class="text-xs text-[color:var(--muted)] mb-2">Revoir la prestation</div>
+    <div class="grid ${ex.length > 1 ? 'sm:grid-cols-2' : ''} gap-4 justify-items-center">${ex.map(x => `
+      <div class="w-full max-w-[270px]">
+        <div class="text-xs text-center mb-1 text-[color:var(--gold-soft)]">${esc(x.a.name)}</div>
+        <div class="rounded-xl overflow-hidden border border-white/10 bg-black aspect-[9/16]">
+          <iframe src="https://www.youtube-nocookie.com/embed/${x.id}?rel=0&playsinline=1" title="Prestation de ${esc(x.a.name)}" class="w-full h-full" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+        </div>
+        <a href="${esc(x.a.shortUrl)}" target="_blank" rel="noopener noreferrer" class="block text-center text-xs text-[color:var(--muted)] hover:text-white underline underline-offset-4 mt-1.5">Ouvrir sur YouTube</a>
+      </div>`).join('')}</div></div>`;
+}
+function blindOption(a, b, q) {
+  const answered = !!b.picked, isRight = a.id === q.correctId, isPicked = b.picked === a.id;
+  let cls = 'hover:border-[color:var(--gold)] hover:-translate-y-0.5';
+  if (answered) cls = isRight ? 'border-emerald-400 bg-emerald-400/15' : (isPicked ? 'border-rose-400 bg-rose-400/15' : 'opacity-45');
+  return `<button type="button" data-act="blind-answer" data-id="${a.id}" ${answered ? 'disabled' : ''} class="glass rounded-2xl p-3 flex items-center gap-3 text-left transition ${cls}">
+    <img src="${avatarSrc(a)}" alt="" class="w-14 h-14 rounded-full object-cover object-top border border-white/20 shrink-0">
+    <span class="font-semibold text-base min-w-0 truncate">${esc(a.name)}</span>
+    ${answered && isRight ? '<span class="ml-auto text-emerald-300 shrink-0">✓</span>' : (answered && isPicked ? '<span class="ml-auto text-rose-300 shrink-0">✗</span>' : '')}
+  </button>`;
+}
+function viewBlind() {
+  const b = S.ui.blind, pool = blindPool(), best = Store.get('sa_blind_best', 0);
+  const head = `<div class="mb-6">
+    <h1 class="font-display font-extrabold text-3xl sm:text-4xl">Blind <span class="gold-text">test</span></h1>
+    <p class="text-[color:var(--muted)] mt-1">Un titre chanté au prime s\u2019affiche : retrouve qui l\u2019a interprété ! ${BLIND_SECONDS} secondes par question.</p></div>`;
+  if (!b || b.phase === 'start') {
+    if (!pool.length) return head + '<div class="glass rounded-2xl p-8 text-center text-[color:var(--muted)]">Aucun titre disponible pour le moment.</div>';
+    const sizes = [...new Set([5, 10, pool.length].filter(n => n <= pool.length))].sort((x, y) => x - y);
+    return head + `<section class="glass rounded-3xl p-6 sm:p-8 max-w-2xl relative overflow-hidden">
+      <div class="absolute -top-20 -right-16 w-64 h-64 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,.5),transparent 65%)"></div>
+      <div class="relative">
+        <div class="flex items-center gap-4">
+          <div class="vinyl w-20 h-20 rounded-full border border-white/10 grid place-items-center shrink-0"><div class="w-7 h-7 rounded-full" style="background:linear-gradient(135deg,#ffe9a8,#d9a520)"></div></div>
+          <div><div class="font-display font-bold text-2xl">Qui a chanté ce titre ?</div><div class="text-sm text-[color:var(--muted)] mt-1">${pool.length} titres du prime 1 · ${pool.filter(q => blindExtracts(q).length).length} avec short YouTube · 4 choix</div></div>
+        </div>
+        <ul class="text-sm text-[color:var(--muted)] mt-5 space-y-1.5 list-disc pl-5">
+          <li>Une bonne réponse rapporte 100 points, plus 5 points par seconde restante.</li>
+          <li>Pour les duos, les deux interprètes sont des bonnes réponses.</li>
+          <li>Après ta réponse, tu peux revoir la prestation en short YouTube.</li>
+        </ul>
+        ${best ? `<p class="mt-4 text-sm text-[color:var(--gold-soft)]">Ton record : <b>${best} points</b></p>` : ''}
+        <div class="mt-5 text-sm text-[color:var(--muted)]">Nombre de questions</div>
+        <div class="flex flex-wrap gap-2 mt-2">${sizes.map(n => `<button data-act="blind-start" data-v="${n}" class="btn-gold rounded-xl px-5 py-3">${n === pool.length ? 'Tous les titres (' + n + ')' : n + ' questions'}</button>`).join('')}</div>
+      </div></section>`;
+  }
+  if (b.phase === 'end') {
+    const total = b.qs.length, pct = Math.round(b.correct / total * 100);
+    const label = pct === 100 ? 'Fan ultime !' : pct >= 70 ? 'Excellente oreille !' : pct >= 40 ? 'Pas mal du tout !' : 'Il faut réécouter le prime !';
+    return head + `<section class="glass rounded-3xl p-6 sm:p-8 max-w-2xl text-center pop-in">
+      <div class="text-[color:var(--gold)] flex justify-center">${ICON.star.replace('w-4 h-4', 'w-10 h-10')}</div>
+      <h2 class="font-display font-extrabold text-3xl gold-text mt-1">${label}</h2>
+      <div class="font-display font-extrabold text-6xl mt-3">${b.score}<span class="text-2xl text-[color:var(--muted)]"> pts</span></div>
+      <p class="text-[color:var(--muted)] mt-1">${b.correct} bonne${b.correct > 1 ? 's' : ''} réponse${b.correct > 1 ? 's' : ''} sur ${total}</p>
+      ${b.record ? '<p class="mt-2 inline-block rounded-full px-3 py-1 text-sm border border-[color:var(--gold)]/50 bg-[rgba(245,196,81,.14)] text-[color:var(--gold-soft)]">Nouveau record !</p>' : ''}
+      <div class="text-left mt-6 space-y-1.5">${b.results.map(r => `<div class="flex items-center gap-2 text-sm rounded-lg bg-black/20 px-3 py-2"><span class="${r.ok ? 'text-emerald-300' : 'text-rose-300'} shrink-0">${r.ok ? '✓' : '✗'}</span><span class="truncate flex-1">${esc(r.title)}</span><span class="text-[color:var(--muted)] shrink-0">${esc(r.singers.map(id => acad(id)?.name || '').join(' & '))}</span></div>`).join('')}</div>
+      <div class="flex flex-wrap justify-center gap-3 mt-6">
+        <button data-act="blind-start" data-v="${total}" class="btn-gold rounded-xl px-6 py-3">Rejouer</button>
+        <button data-act="blind-quit" class="btn-ghost rounded-xl px-5 py-3 text-sm">Changer de mode</button>
+      </div></section>`;
+  }
+  const q = b.qs[b.i], answered = !!b.picked, total = b.qs.length, ex = blindExtracts(q);
+  const names = q.singers.map(id => acad(id)?.name || '').filter(Boolean).join(' et ');
+  const verdict = b.picked === 'timeout' ? 'Temps écoulé !' : b.ok ? 'Bravo ! +' + b.gain + ' points' : 'Raté !';
+  return head + `<section class="max-w-2xl">
+    <div class="flex items-center justify-between text-sm mb-2">
+      <span class="text-[color:var(--muted)]">Question <b class="text-white">${b.i + 1}</b>/${total}</span>
+      <span class="text-[color:var(--gold-soft)]">Score : <b>${b.score}</b></span>
+      <span class="${answered ? 'text-[color:var(--muted)]' : 'text-white'} tabular-nums"><span id="blindSec">${Math.max(0, b.timeLeft)}</span> s</span>
+    </div>
+    <div class="h-2 rounded-full bg-white/10 overflow-hidden mb-4"><div id="blindBar" class="h-full rounded-full" style="width:${Math.max(0, b.timeLeft / BLIND_SECONDS * 100)}%;transition:width 1s linear;background:linear-gradient(90deg,#7c3aed,#f5c451)"></div></div>
+    <div class="glass rounded-3xl p-5 sm:p-6 text-center relative overflow-hidden">
+      <div class="absolute -top-16 -left-12 w-56 h-56 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,.4),transparent 65%)"></div>
+      <div class="relative">
+        <div class="vinyl w-20 h-20 rounded-full border border-white/10 grid place-items-center mx-auto" style="${answered ? 'animation-play-state:paused' : ''}"><div class="w-7 h-7 rounded-full" style="background:linear-gradient(135deg,#ffe9a8,#d9a520)"></div></div>
+        <div class="text-xs tracking-widest text-[color:var(--muted)] mt-4">TITRE INTERPRÉTÉ AU PRIME 1</div>
+        <h2 class="font-display font-extrabold text-2xl sm:text-3xl gold-text leading-tight mt-1">${esc(q.title)}</h2>
+        <p class="text-[color:var(--muted)] mt-1">${esc(q.artist)}</p>
+        <p class="font-semibold mt-4">Qui l\u2019a chanté ?</p>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">${q.options.map(id => blindOption(acad(id), b, q)).join('')}</div>
+    ${answered ? `<div class="glass rounded-2xl p-4 mt-4 pop-in ${b.ok ? 'border-emerald-400/50' : 'border-rose-400/50'}">
+      <div class="font-display font-bold text-xl ${b.ok ? 'text-emerald-300' : 'text-rose-300'}">${verdict}</div>
+      <p class="mt-1">Ce titre a été chanté par <b class="text-[color:var(--gold-soft)]">${esc(names)}</b>${q.singers.length > 1 ? ' (duo)' : ''}.</p>
+      ${q.note ? `<p class="text-sm text-[color:var(--muted)] mt-1">${esc(q.note)}</p>` : ''}
+      ${ex.length ? extractPlayers(ex) : '<p class="text-xs text-[color:var(--muted)] mt-3">Le short de cette prestation n\u2019est pas encore disponible sur le site.</p>'}
+      <div class="mt-4"><div class="text-xs text-[color:var(--muted)] mb-1.5">Écouter l\u2019original</div>${smartLinks(q.title + ' ' + q.artist, true)}</div>
+      <button data-act="blind-next" class="btn-gold rounded-xl w-full py-3 mt-4">${b.i + 1 >= total ? 'Voir mon score' : 'Question suivante'}</button>
+    </div>` : ''}
+    <button data-act="blind-quit" class="mt-5 text-xs text-[color:var(--muted)] hover:text-white underline underline-offset-4">Abandonner la partie</button>
+  </section>`;
+}
+
 function allTracks() {
   return [...S.tracks];
 }
@@ -985,6 +1175,27 @@ function viewMusic() {
 /* =========================================================
    VUE : PROFIL
    ========================================================= */
+function adminCard() {
+  if (Cloud.mode !== 'firebase' || !Cloud.isAdmin) return '';
+  const n = Object.keys(S.overrides).length;
+  return `<section class="glass rounded-3xl p-5 mt-6 border border-[color:var(--gold)]/40">
+    <div class="flex items-center gap-2"><span class="text-[color:var(--gold)]">${ICON.star}</span><h2 class="font-display font-bold text-xl">Administration</h2></div>
+    <p class="text-sm text-[color:var(--muted)] mt-1">Tes modifications de fiches (statut, ville, Instagram, TikTok, short, nominations) sont visibles par tous les visiteurs.</p>
+    ${n ? `<button data-act="admin-import" class="btn-gold rounded-xl px-4 py-2.5 text-sm mt-3">Publier mes modifications locales (${n} fiche${n > 1 ? 's' : ''})</button><p class="text-xs text-[color:var(--muted)] mt-2">Envoie à tous les visiteurs ce que tu avais saisi à la main dans ce navigateur.</p>` : '<p class="text-xs text-emerald-300 mt-2">Aucune modification locale en attente.</p>'}
+  </section>`;
+}
+async function importLocalOverrides() {
+  if (!Cloud.isAdmin) return toast('Réservé à l\u2019administrateur.', 'err');
+  let n = 0;
+  try {
+    for (const id of Object.keys(S.overrides)) {
+      const o = S.overrides[id], data = {};
+      ['status', 'age', 'city', 'insta', 'tiktok', 'shortUrl', 'nominations', 'tops'].forEach(k => { if (o[k] !== undefined && o[k] !== null && o[k] !== '') data[k] = o[k]; });
+      if (Object.keys(data).length) { await FB.setFiche(id, data); n++; }
+    }
+    S.overrides = {}; save(); render(); toast(n + ' fiche(s) publiée(s) pour tous les visiteurs.');
+  } catch (e) { console.warn(e); toast(e && e.code === 'permission-denied' ? 'Refusé : ton compte n\u2019est pas administrateur dans Firebase.' : 'Publication impossible.', 'err'); }
+}
 function viewProfile() {
   const u = me();
   if (!u) return `<div class="glass rounded-3xl p-10 text-center max-w-md mx-auto mt-6">
@@ -1010,7 +1221,7 @@ function viewProfile() {
   <section class="grid grid-cols-3 gap-3 mt-5">
     ${[['Votes publiés', mine.length], ['J\u2019aime reçus', likesGot], ['Inscrit le', new Date(u.createdAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })]].map(([l, v]) => `<div class="glass rounded-2xl p-4 text-center"><div class="font-display font-extrabold text-2xl gold-text">${v}</div><div class="text-xs text-[color:var(--muted)] mt-0.5">${l}</div></div>`).join('')}
   </section>
-  <section class="mt-6">
+  ${adminCard()}<section class="mt-6">
     <h2 class="font-display font-bold text-xl mb-3">Mon historique</h2>
     <div class="space-y-3">${mine.length ? mine.map(v => {
     const a = acad(v.acadId); if (!a) return '';
@@ -1184,7 +1395,7 @@ function ficheModal(id) {
       ${perfSection(a)}
       <div class="flex gap-2 mt-6">
         <button data-act="vote-for" data-id="${a.id}" class="btn-gold rounded-xl flex-1 py-3 ${a.status === 'Éliminé' ? 'opacity-40 pointer-events-none' : ''}" ${a.status === 'Éliminé' ? 'disabled' : ''}>Voter pour ${esc(a.name)}</button>
-        <button data-act="open-edit" data-id="${a.id}" class="btn-ghost rounded-xl px-4">Modifier la fiche</button>
+        ${Cloud.mode !== 'firebase' || Cloud.isAdmin ? `<button data-act="open-edit" data-id="${a.id}" class="btn-ghost rounded-xl px-4">Modifier la fiche</button>` : ''}
       </div>
     </div>
   </div>`;
@@ -1194,11 +1405,14 @@ function editModal(id) {
   const a = acad(id); if (!a) return '';
   return `<form id="editForm" data-id="${id}" class="p-6 sm:p-8">
     <h2 class="font-display font-bold text-2xl gold-text mb-4">Modifier la fiche de ${esc(a.name)}</h2>
+    ${Cloud.mode === 'firebase' ? '<p class="text-xs text-emerald-300 -mt-2 mb-3">Administrateur : tes modifications seront visibles par tous les visiteurs.</p>' : ''}
+    ${Cloud.mode === 'firebase' ? '' : `
     <div class="flex items-center gap-4 mb-4">
       <img id="photoPrev" src="${avatarSrc(a)}" alt="" class="w-16 h-16 rounded-xl object-cover">
       <label class="btn-ghost rounded-xl px-4 py-2 text-sm cursor-pointer">Changer la photo<input id="photoIn" type="file" accept="image/*" class="sr-only"></label>
       ${a.photo ? `<button type="button" data-act="rm-photo" class="text-xs text-[color:var(--muted)] underline">Retirer</button>` : ''}
     </div>
+    `}
     <div class="grid grid-cols-2 gap-3">
       <div><label class="text-sm text-[color:var(--muted)]" for="e_status">Statut</label><select id="e_status" class="field mt-1">${STATUSES.map(s => `<option ${a.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
       <div><label class="text-sm text-[color:var(--muted)]" for="e_age">Âge</label><input id="e_age" type="number" min="14" max="99" class="field mt-1" value="${a.age ?? ''}"></div>
@@ -1263,7 +1477,13 @@ document.addEventListener('click', (e) => {
     case 'friend-add': addFriend(id); break;
     case 'friend-add-q': addFriendByPseudo(); break;
     case 'friend-del': removeFriend(id); break;
+    case 'admin-import': importLocalOverrides(); break;
+    case 'blind-start': blindStart(parseInt(v, 10)); break;
+    case 'blind-answer': blindAnswer(id); break;
+    case 'blind-next': blindNext(); break;
+    case 'blind-quit': stopBlindTimer(); S.ui.blind = null; render(); break;
     case 'social-login': socialLogin(v); break;
+    case 'social-redirect': FB.signInRedirect(v).catch(e => { console.warn(e); toast(fbError(e), 'err'); }); break;
     case 'pw-reset': {
       const em = ($('#f_email')?.value || '').trim();
       if (!em) { toast('Saisis ton e-mail dans le formulaire.', 'err'); break; }
@@ -1362,6 +1582,15 @@ document.addEventListener('submit', async (e) => {
     const rawShort = $('#e_short').value.trim();
     if (rawShort && !cleanShort(rawShort)) return toast('Lien du short invalide (YouTube, TikTok, Instagram ou TF1).', 'err');
     S.overrides[id] = { ...prev, status: $('#e_status').value, age: $('#e_age').value ? num($('#e_age').value, null) : null, city: $('#e_city').value.trim() || null, insta: cleanHandle($('#e_insta').value), tiktok: cleanTiktok($('#e_tiktok').value), shortUrl: cleanShort($('#e_short').value), nominations: num($('#e_nom').value), tops: num($('#e_tops').value) };
+    if (Cloud.mode === 'firebase') {
+      const o = { ...S.overrides[id] };
+      if (!Cloud.isAdmin) { S.overrides[id] = prev; return toast('Modification réservée à l\u2019administrateur.', 'err'); }
+      S.overrides[id] = prev;
+      FB.setFiche(id, { status: o.status, age: o.age ?? null, city: o.city ?? null, insta: o.insta ?? null, tiktok: o.tiktok ?? null, shortUrl: o.shortUrl ?? null, nominations: o.nominations ?? 0, tops: o.tops ?? 0 })
+        .then(() => toast('Fiche publiée pour tous les visiteurs'))
+        .catch((e) => { console.warn(e); toast(e && e.code === 'permission-denied' ? 'Refusé : ton compte n\u2019est pas administrateur dans Firebase.' : 'Enregistrement impossible.', 'err'); });
+      S.ui.modal = { type: 'fiche', id }; render(); return;
+    }
     if (pendingPhoto) S.overrides[id].photo = pendingPhoto;
     save(); S.ui.modal = { type: 'fiche', id }; render(); toast('Fiche mise à jour');
   }
@@ -1436,7 +1665,10 @@ try {
     resetPw: (e) => A.sendPasswordResetEmail(auth, e),
     onAuth: (cb) => A.onAuthStateChanged(auth, cb),
     onDocs: (cb, err) => F.onSnapshot(F.collection(db, 'u'), (snap) => { const o = {}; snap.forEach(d => { o[d.id] = d.data(); }); cb(o); }, err),
-    setDoc: (uid, data) => F.setDoc(F.doc(db, 'u', uid), data)
+    setDoc: (uid, data) => F.setDoc(F.doc(db, 'u', uid), data),
+    onFiches: (cb, err) => F.onSnapshot(F.collection(db, 'fiches'), (snap) => { const o = {}; snap.forEach(d => { o[d.id] = d.data(); }); cb(o); }, err),
+    setFiche: (id, data) => F.setDoc(F.doc(db, 'fiches', id), data, { merge: true }),
+    isAdmin: (uid) => F.getDoc(F.doc(db, 'admins', uid)).then(d => d.exists()).catch(() => false)
   };
   A.getRedirectResult(auth).catch((e) => console.warn('Retour de connexion', e));
 } catch (e) { console.warn('Firebase indisponible : mode local', e); window.FB = null; }
