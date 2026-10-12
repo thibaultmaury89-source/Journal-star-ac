@@ -282,7 +282,7 @@ function socialButtons() {
 }
 async function initFirebase() {
   Cloud.mode = 'firebase'; Cloud.on = true;
-  FB.onFiches((o) => { Cloud.fiches = o; softRender(); }, (e) => { console.warn('Fiches partagées indisponibles', e); Cloud.fiches = {}; });
+  FB.onFiches((o) => { Cloud.fiches = o; Cloud.fichesError = false; softRender(); }, (e) => { console.warn('Fiches partagées indisponibles', e); Cloud.fiches = {}; Cloud.fichesError = true; softRender(); });
   await new Promise((resolve) => {
     let a = false, d = false;
     const check = () => { if (a && d) resolve(); };
@@ -1068,6 +1068,24 @@ function extractPlayers(ex) {
         <a href="${esc(x.a.shortUrl)}" target="_blank" rel="noopener noreferrer" class="block text-center text-xs text-[color:var(--muted)] hover:text-white underline underline-offset-4 mt-1.5">Ouvrir sur YouTube</a>
       </div>`).join('')}</div></div>`;
 }
+function blindDiag(pool) {
+  const noEx = pool.filter(q => !blindExtracts(q).length);
+  if (!noEx.length) return '<p class="mt-4 text-xs text-emerald-300">Tous les titres ont un short YouTube : l\u2019extrait se lance à chaque question.</p>';
+  const missing = noEx.map(q => q.singers.map(id => acad(id)?.name).filter(Boolean).join(' & ')).join(', ');
+  const fb = Cloud.mode === 'firebase', pending = Object.keys(S.overrides).length;
+  let msg = '';
+  if (noEx.length === pool.length) {
+    if (fb && Cloud.fichesError) msg = 'Les fiches partagées ne se chargent pas : vérifie que les règles Firestore sont publiées.';
+    else if (fb) msg = 'Aucun short n\u2019est enregistré dans les fiches partagées. ' + (Cloud.isAdmin ? 'Ajoute-les avec « Modifier la fiche »' + (pending ? ' ou publie tes modifications locales ci-dessous.' : '.') : 'L\u2019administrateur doit les ajouter.');
+    else msg = 'Mode local : les shorts saisis dans « Modifier la fiche » restent dans ce navigateur, et ne sont visibles que sur cet appareil.';
+  }
+  return `<div class="mt-4 rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-200">
+    <div class="font-semibold">Extraits : ${pool.length - noEx.length} titre${pool.length - noEx.length > 1 ? 's' : ''} sur ${pool.length} avec un short YouTube valide</div>
+    ${msg ? `<p class="mt-1">${msg}</p>` : ''}
+    ${fb && Cloud.isAdmin && pending ? `<button data-act="admin-import" class="btn-gold rounded-lg px-3 py-1.5 text-xs mt-2">Publier mes modifications locales (${pending})</button>` : ''}
+    <p class="mt-1.5 text-amber-200/80">Sans short pour : ${esc(missing)}</p>
+  </div>`;
+}
 function blindOption(a, b, q) {
   const answered = !!b.picked, isRight = a.id === q.correctId, isPicked = b.picked === a.id;
   let cls = 'hover:border-[color:var(--gold)] hover:-translate-y-0.5';
@@ -1100,6 +1118,7 @@ function viewBlind() {
         </ul>
         <label class="flex items-start gap-3 mt-4 text-sm cursor-pointer"><input type="checkbox" data-act="blind-toggle-extract" ${Store.get('sa_blind_extract', true) !== false ? 'checked' : ''} class="w-4 h-4 mt-0.5 accent-[#f5c451]"><span>Lancer l\u2019extrait vidéo pendant le compte à rebours <span class="text-[color:var(--muted)]">(sinon, il s\u2019affiche après ta réponse)</span></span></label>
         ${best ? `<p class="mt-4 text-sm text-[color:var(--gold-soft)]">Ton record : <b>${best} points</b></p>` : ''}
+        ${blindDiag(pool)}
         <div class="mt-5 text-sm text-[color:var(--muted)]">Nombre de questions</div>
         <div class="flex flex-wrap gap-2 mt-2">${sizes.map(n => `<button data-act="blind-start" data-v="${n}" class="btn-gold rounded-xl px-5 py-3">${n === pool.length ? 'Tous les titres (' + n + ')' : n + ' questions'}</button>`).join('')}</div>
       </div></section>`;
