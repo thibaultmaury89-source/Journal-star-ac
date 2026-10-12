@@ -1024,7 +1024,13 @@ function blindAnswer(pick) {
   b.picked = pick; b.ok = ok;
   if (ok) { b.correct++; b.gain = 100 + Math.max(0, b.timeLeft) * 5; b.score += b.gain; } else b.gain = 0;
   b.results.push({ title: q.title, ok, singers: q.singers });
-  render();
+  const opts = $('#blindOptions'), rev = $('#blindReveal');
+  if (b.mainShown && $('#blindPlayer') && opts && rev) {
+    opts.innerHTML = q.options.map(id => blindOption(acad(id), b, q)).join('');
+    rev.innerHTML = blindRevealHTML(b, q);
+    const sc = $('#blindScoreVal'); if (sc) sc.textContent = b.score;
+    if (rev.scrollIntoView) rev.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } else render();
 }
 function blindNext() {
   const b = S.ui.blind; if (!b || !b.picked) return;
@@ -1066,9 +1072,9 @@ function blindOption(a, b, q) {
   const answered = !!b.picked, isRight = a.id === q.correctId, isPicked = b.picked === a.id;
   let cls = 'hover:border-[color:var(--gold)] hover:-translate-y-0.5';
   if (answered) cls = isRight ? 'border-emerald-400 bg-emerald-400/15' : (isPicked ? 'border-rose-400 bg-rose-400/15' : 'opacity-45');
-  return `<button type="button" data-act="blind-answer" data-id="${a.id}" ${answered ? 'disabled' : ''} class="glass rounded-2xl p-3 flex items-center gap-3 text-left transition ${cls}">
-    <img src="${avatarSrc(a)}" alt="" class="w-14 h-14 rounded-full object-cover object-top border border-white/20 shrink-0">
-    <span class="font-semibold text-base min-w-0 truncate">${esc(a.name)}</span>
+  return `<button type="button" data-act="blind-answer" data-id="${a.id}" ${answered ? 'disabled' : ''} class="glass rounded-2xl p-2.5 sm:p-3 flex items-center gap-2.5 sm:gap-3 text-left transition ${cls}">
+    <img src="${avatarSrc(a)}" alt="" class="w-11 h-11 sm:w-14 sm:h-14 rounded-full object-cover object-top border border-white/20 shrink-0">
+    <span class="font-semibold text-sm sm:text-base min-w-0 truncate">${esc(a.name)}</span>
     ${answered && isRight ? '<span class="ml-auto text-emerald-300 shrink-0">✓</span>' : (answered && isPicked ? '<span class="ml-auto text-rose-300 shrink-0">✗</span>' : '')}
   </button>`;
 }
@@ -1090,8 +1096,9 @@ function viewBlind() {
         <ul class="text-sm text-[color:var(--muted)] mt-5 space-y-1.5 list-disc pl-5">
           <li>Une bonne réponse rapporte 100 points, plus 5 points par seconde restante.</li>
           <li>Pour les duos, les deux interprètes sont des bonnes réponses.</li>
-          <li>Après ta réponse, tu peux revoir la prestation en short YouTube.</li>
+          <li>Quand un short est disponible, l\u2019extrait peut se lancer pendant le compte à rebours.</li>
         </ul>
+        <label class="flex items-start gap-3 mt-4 text-sm cursor-pointer"><input type="checkbox" data-act="blind-toggle-extract" ${Store.get('sa_blind_extract', true) !== false ? 'checked' : ''} class="w-4 h-4 mt-0.5 accent-[#f5c451]"><span>Lancer l\u2019extrait vidéo pendant le compte à rebours <span class="text-[color:var(--muted)]">(sinon, il s\u2019affiche après ta réponse)</span></span></label>
         ${best ? `<p class="mt-4 text-sm text-[color:var(--gold-soft)]">Ton record : <b>${best} points</b></p>` : ''}
         <div class="mt-5 text-sm text-[color:var(--muted)]">Nombre de questions</div>
         <div class="flex flex-wrap gap-2 mt-2">${sizes.map(n => `<button data-act="blind-start" data-v="${n}" class="btn-gold rounded-xl px-5 py-3">${n === pool.length ? 'Tous les titres (' + n + ')' : n + ' questions'}</button>`).join('')}</div>
@@ -1112,17 +1119,24 @@ function viewBlind() {
         <button data-act="blind-quit" class="btn-ghost rounded-xl px-5 py-3 text-sm">Changer de mode</button>
       </div></section>`;
   }
+  const extractOn = Store.get('sa_blind_extract', true) !== false;
   const q = b.qs[b.i], answered = !!b.picked, total = b.qs.length, ex = blindExtracts(q);
-  const names = q.singers.map(id => acad(id)?.name || '').filter(Boolean).join(' et ');
-  const verdict = b.picked === 'timeout' ? 'Temps écoulé !' : b.ok ? 'Bravo ! +' + b.gain + ' points' : 'Raté !';
-  return head + `<section class="max-w-2xl">
-    <div class="flex items-center justify-between text-sm mb-2">
-      <span class="text-[color:var(--muted)]">Question <b class="text-white">${b.i + 1}</b>/${total}</span>
-      <span class="text-[color:var(--gold-soft)]">Score : <b>${b.score}</b></span>
-      <span class="${answered ? 'text-[color:var(--muted)]' : 'text-white'} tabular-nums"><span id="blindSec">${Math.max(0, b.timeLeft)}</span> s</span>
-    </div>
-    <div class="h-2 rounded-full bg-white/10 overflow-hidden mb-4"><div id="blindBar" class="h-full rounded-full" style="width:${Math.max(0, b.timeLeft / BLIND_SECONDS * 100)}%;transition:width 1s linear;background:linear-gradient(90deg,#7c3aed,#f5c451)"></div></div>
-    <div class="glass rounded-3xl p-5 sm:p-6 text-center relative overflow-hidden">
+  const main = extractOn ? (ex.find(x => x.a.id === q.correctId) || ex[0] || null) : null;
+  b.mainShown = !!main;
+  const card = main ? `<div class="glass rounded-3xl p-4 sm:p-5 relative overflow-hidden">
+      <div class="absolute -top-16 -left-12 w-56 h-56 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,.4),transparent 65%)"></div>
+      <div class="relative flex flex-col sm:flex-row items-center gap-4 sm:gap-6">
+        <div class="shrink-0 w-[200px]">
+          <div id="blindPlayer" class="rounded-xl overflow-hidden border border-white/10 bg-black aspect-[9/16]"><iframe src="https://www.youtube-nocookie.com/embed/${main.id}?autoplay=${answered ? 0 : 1}&rel=0&playsinline=1" title="Extrait de la prestation" class="w-full h-full" referrerpolicy="strict-origin-when-cross-origin" allow="autoplay; accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe></div>
+        </div>
+        <div class="min-w-0 text-center sm:text-left">
+          <div class="text-xs tracking-widest text-[color:var(--muted)]">TITRE INTERPRÉTÉ AU PRIME 1</div>
+          <h2 class="font-display font-extrabold text-2xl sm:text-3xl gold-text leading-tight mt-1">${esc(q.title)}</h2>
+          <p class="text-[color:var(--muted)] mt-1">${esc(q.artist)}</p>
+          <p class="font-semibold mt-4">Qui l\u2019a chanté ?</p>
+          <p class="text-[11px] text-[color:var(--muted)] mt-3">Si l\u2019extrait ne démarre pas tout seul, appuie sur lecture : certains navigateurs bloquent la lecture automatique avec le son.</p>
+        </div>
+      </div></div>` : `<div class="glass rounded-3xl p-5 sm:p-6 text-center relative overflow-hidden">
       <div class="absolute -top-16 -left-12 w-56 h-56 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,.4),transparent 65%)"></div>
       <div class="relative">
         <div class="vinyl w-20 h-20 rounded-full border border-white/10 grid place-items-center mx-auto" style="${answered ? 'animation-play-state:paused' : ''}"><div class="w-7 h-7 rounded-full" style="background:linear-gradient(135deg,#ffe9a8,#d9a520)"></div></div>
@@ -1130,19 +1144,33 @@ function viewBlind() {
         <h2 class="font-display font-extrabold text-2xl sm:text-3xl gold-text leading-tight mt-1">${esc(q.title)}</h2>
         <p class="text-[color:var(--muted)] mt-1">${esc(q.artist)}</p>
         <p class="font-semibold mt-4">Qui l\u2019a chanté ?</p>
-      </div>
+      </div></div>`;
+  return head + `<section class="max-w-2xl">
+    <div class="flex items-center justify-between text-sm mb-2">
+      <span class="text-[color:var(--muted)]">Question <b class="text-white">${b.i + 1}</b>/${total}</span>
+      <span class="text-[color:var(--gold-soft)]">Score : <b id="blindScoreVal">${b.score}</b></span>
+      <span class="${answered ? 'text-[color:var(--muted)]' : 'text-white'} tabular-nums"><span id="blindSec">${Math.max(0, b.timeLeft)}</span> s</span>
     </div>
-    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">${q.options.map(id => blindOption(acad(id), b, q)).join('')}</div>
-    ${answered ? `<div class="glass rounded-2xl p-4 mt-4 pop-in ${b.ok ? 'border-emerald-400/50' : 'border-rose-400/50'}">
+    <div class="h-2 rounded-full bg-white/10 overflow-hidden mb-4"><div id="blindBar" class="h-full rounded-full" style="width:${Math.max(0, b.timeLeft / BLIND_SECONDS * 100)}%;transition:width 1s linear;background:linear-gradient(90deg,#7c3aed,#f5c451)"></div></div>
+    ${card}
+    <div id="blindOptions" class="grid grid-cols-2 gap-2.5 sm:gap-3 mt-4">${q.options.map(id => blindOption(acad(id), b, q)).join('')}</div>
+    <div id="blindReveal">${answered ? blindRevealHTML(b, q) : ''}</div>
+    <button data-act="blind-quit" class="mt-5 text-xs text-[color:var(--muted)] hover:text-white underline underline-offset-4">Abandonner la partie</button>
+  </section>`;
+}
+function blindRevealHTML(b, q) {
+  const ex = blindExtracts(q), total = b.qs.length;
+  const names = q.singers.map(id => acad(id)?.name || '').filter(Boolean).join(' et ');
+  const verdict = b.picked === 'timeout' ? 'Temps écoulé !' : b.ok ? 'Bravo ! +' + b.gain + ' points' : 'Raté !';
+  const extra = b.mainShown ? '' : (ex.length ? extractPlayers(ex) : '<p class="text-xs text-[color:var(--muted)] mt-3">Le short de cette prestation n\u2019est pas encore disponible sur le site.</p>');
+  return `<div class="glass rounded-2xl p-4 mt-4 pop-in ${b.ok ? 'border-emerald-400/50' : 'border-rose-400/50'}">
       <div class="font-display font-bold text-xl ${b.ok ? 'text-emerald-300' : 'text-rose-300'}">${verdict}</div>
       <p class="mt-1">Ce titre a été chanté par <b class="text-[color:var(--gold-soft)]">${esc(names)}</b>${q.singers.length > 1 ? ' (duo)' : ''}.</p>
       ${q.note ? `<p class="text-sm text-[color:var(--muted)] mt-1">${esc(q.note)}</p>` : ''}
-      ${ex.length ? extractPlayers(ex) : '<p class="text-xs text-[color:var(--muted)] mt-3">Le short de cette prestation n\u2019est pas encore disponible sur le site.</p>'}
+      ${extra}
       <div class="mt-4"><div class="text-xs text-[color:var(--muted)] mb-1.5">Écouter l\u2019original</div>${smartLinks(q.title + ' ' + q.artist, true)}</div>
       <button data-act="blind-next" class="btn-gold rounded-xl w-full py-3 mt-4">${b.i + 1 >= total ? 'Voir mon score' : 'Question suivante'}</button>
-    </div>` : ''}
-    <button data-act="blind-quit" class="mt-5 text-xs text-[color:var(--muted)] hover:text-white underline underline-offset-4">Abandonner la partie</button>
-  </section>`;
+    </div>`;
 }
 
 function allTracks() {
@@ -1501,6 +1529,7 @@ document.addEventListener('click', (e) => {
 document.addEventListener('change', (e) => {
   const el = e.target;
   if (el.dataset?.act === 'feed-filter') { S.ui.feedFilter = el.value; render(); }
+  if (el.dataset?.act === 'blind-toggle-extract') Store.set('sa_blind_extract', !!el.checked);
   if (el.dataset?.act === 'set-fav') { const u = me(); if (Cloud.on) cloudUpdate({ favorite: el.value }); else { u.favorite = el.value; save(); render(); } toast('Favori mis à jour'); }
   if (el.id === 'photoIn' && el.files[0]) {
     const img = new Image(), url = URL.createObjectURL(el.files[0]);
